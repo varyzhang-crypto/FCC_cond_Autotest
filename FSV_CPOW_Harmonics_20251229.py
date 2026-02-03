@@ -1,0 +1,1235 @@
+# -*- coding: utf-8 -*-
+"""
+一脚完成：
+1) 2412 MHz 主载波 20 MHz 通道功率 (CPOW)
+2) 所有谐波 (2f, 3f, ...)，直到频率 <= 18 GHz
+
+谐波部分：
+- 每个谐波中心：n * 2412 MHz
+- Span: 100 MHz（如需按 FCC 改，可调整）
+- RBW / VBW: 1 MHz
+- 衰减列表: [25, 20, 15] dB
+- 每个 ATT：INIT:IMM;*WAI → CALC:MARK1:MAX → X?/Y?
+"""
+
+import socket
+import importlib.util
+import time
+import re
+import subprocess
+from copy import copy
+import tkinter as tk
+from tkinter import simpledialog
+from pathlib import Path
+from typing import Optional, List, Dict, Any, Tuple
+import csv
+import os
+import sys
+from fractions import Fraction
+
+
+FSV_IP = "192.168.20.151"
+FSV_PORT = 5025
+SOCKET_TIMEOUT = 10.0
+SCPI_DELAY = 0.0
+_FSV_INITIALIZED = False
+
+GUI_HOST = "192.168.20.11"
+GUI_PORT = 7481
+GUI_TIMEOUT = 5.0
+USE_GUI_CALIBRATION = True
+CMD_DELAY = 1.0
+TX_START_STABLE_S = 0.8
+STOP_AFTER_START_TX = False
+SIMPLE_GUI_FLOW = False
+STOP_AFTER_CALIBRATION = False
+AUTO_LAUNCH_GUI = True
+GUI_EXE_PATH = r"E:\Altobeam GUI\WiFi6_GUI_20251223\WiFi6_GUI\AtbmWLANFacility_Customer.exe"
+
+INPUT_CSV = "FCC_test_item.xlsx"
+OUTPUT_CSV = "FCC_conduction_result.xlsx"
+LOSS_TABLE_PATH = "loss.txt"
+CONFIG_DIR_NAME = "config"
+RESULT_DIR_NAME = "result"
+
+DEFAULT_TX_CONFIG: Dict[str, object] = {
+    "CHAN": 1,
+    "BW": "20M",
+    "OFFSET": 0,
+    "MODE": "DSSS",
+    "OFDM_MODE": "MM",
+    "RATE": "1M",
+    "CODING": "BCC",
+    "DUTY_CYCLE": 100,
+    "PSDU_LEN": 10000,
+    "CONNECT_TYPE": "USB",
+    "ANTENNA": "",
+    "CERTIFICATION_MODE": "",
+}
+
+KEY_ALIASES = {
+    "CHAN": "CHAN",
+    "CH": "CHAN",
+    "BW": "BW",
+    "OFFSET": "OFFSET",
+    "MODE": "MODE",
+    "OFDM MODE": "OFDM_MODE",
+    "OFDM_MODE": "OFDM_MODE",
+    "RATE": "RATE",
+    "CODING": "CODING",
+    "DUTY CYCLE": "DUTY_CYCLE",
+    "DUTY_CYCLE": "DUTY_CYCLE",
+    "PSDU LEN": "PSDU_LEN",
+    "PSDU_LEN": "PSDU_LEN",
+    "CONNECT TYPE": "CONNECT_TYPE",
+    "CONNECT_TYPE": "CONNECT_TYPE",
+    "ANTENNA": "ANTENNA",
+    "CERTIFICATION": "CERTIFICATION_MODE",
+    "CERTIFICATION MODE": "CERTIFICATION_MODE",
+    "CERTIFICATION_MODE": "CERTIFICATION_MODE",
+}
+
+F0_HZ_DEFAULT = 2.412e9      # 默认 2412 MHz 基波
+MAX_FREQ_HZ = 18e9           # 谐波最高测到 18 GHz
+
+
+class FsvSocket:
+    def __init__(self, ip: str, port: int, timeout: float = 10.0):
+        self.ip = ip
+        self.port = port
+        self.timeout = timeout
+        self.sock: Optional[socket.socket] = None
+
+    def connect(self):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(self.timeout)
+        print(f"[INFO] Connecting to {self.ip}:{self.port} ...")
+        s.connect((self.ip, self.port))
+        self.sock = s
+        print("[INFO] Connected.")
+
+    def close(self):
+        if self.sock:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+            self.sock = None
+            print("[INFO] Socket closed.")
+
+    def send_cmd(self, cmd: str, read_reply: bool = False, bufsize: int = 8192):
+        if not self.sock:
+            raise RuntimeError("Socket not connected")
+        msg = (cmd + "\n").encode("ascii")
+        print("SCPI >>", cmd)
+        self.sock.sendall(msg)
+        if not read_reply:
+            _sleep_cmd(SCPI_DELAY)
+            return None
+        reply = self.sock.recv(bufsize)
+        text = reply.decode(errors="ignore").strip()
+        print("SCPI <<", text)
+        _sleep_cmd(SCPI_DELAY)
+        return text
+
+    def query(self, cmd: str, bufsize: int = 8192) -> str:
+        return self.send_cmd(cmd, read_reply=True, bufsize=bufsize) or ""
+
+    def query_float(self, cmd: str, bufsize: int = 8192) -> float:
+        return float(self.query(cmd, bufsize=bufsize))
+
+    def check_error(self, label: str = "") -> str:
+        err = self.query("SYST:ERR?")
+        if not err.startswith("0"):
+            print(f"[SCPI ERROR]{' '+label if label else ''} {err}")
+        return err
+
+
+def _ensure_fsv_initialized(inst: FsvSocket) -> None:
+    global _FSV_INITIALIZED
+    if _FSV_INITIALIZED:
+        return
+    inst.send_cmd(r"MMEM:LOAD:STAT 1,'C:\R_S\Instr\user/QuickSave\QuickSave8'")
+    inst.send_cmd("*RST")
+    _FSV_INITIALIZED = True
+
+
+def measure_cpow_20m(
+    inst: FsvSocket,
+    f0_hz: float,
+    loss_table: Optional[List[Tuple[float, float, float]]] = None,
+) -> float:
+    """
+    使用 CPOW 读取主载波 20 MHz 通道功率（dBm）
+    只在首次初始化时做 *RST，后续不再重复。
+    """
+    print("\n===== Step1: 2412 MHz 20MHz 通道功率 (CPOW) =====")
+
+    _ensure_fsv_initialized(inst)
+    inst.send_cmd("INIT:CONT OFF")
+    inst.send_cmd(f"SENS:FREQ:CENT {f0_hz:.0f}")
+    inst.send_cmd("SENS:FREQ:SPAN 100000000")  # 100 MHz
+    inst.query("SENS:FREQ:SPAN?")
+
+    inst.send_cmd("DISP:WIND:TRAC:Y:SCAL:RLEV 30")
+    ref_offs = 10.0
+    if loss_table:
+        loss_db = _lookup_cable_loss_db(f0_hz, loss_table)
+        if loss_db is not None:
+            ref_offs = loss_db
+    inst.send_cmd(f"DISP:WIND:TRAC:Y:SCAL:RLEV:OFFS {ref_offs}")
+    inst.send_cmd("INP:ATT:AUTO OFF")
+    inst.send_cmd("INP:ATT 25")
+
+    # RBW =1MHZ VBW = 3MHz
+    inst.send_cmd("SENS:BAND:AUTO OFF")
+    inst.send_cmd("SENS:BAND 1MHz")
+    inst.send_cmd("SENS:BAND:VID:AUTO OFF")
+    inst.send_cmd("SENS:BAND:VID 3MHz")
+
+    # Trace / 平均（跟你之前 step1 一致）
+    inst.send_cmd("DISP:WIND:SUBW:TRAC1:MODE AVER")
+    inst.send_cmd("SENS:WIND:DET1:FUNC RMS")
+    inst.send_cmd("SENS:AVER:TYPE POW")
+    inst.send_cmd("SENS:AVER:COUN 100")
+
+    # 20 MHz 通道带宽
+    inst.send_cmd("SENS:POW:ACH:BWID:CHAN1 20000000")
+
+    # CPOW 功能
+    inst.send_cmd("CALC:MARK:FUNC:POW:SEL CPOW")
+    inst.send_cmd("SENS:FREQ:SPAN 100000000")
+    inst.query("SENS:FREQ:SPAN?")
+
+    inst.send_cmd("INIT")
+    inst.send_cmd("*WAI")
+
+    cpow_str = inst.query("CALC:MARK:FUNC:POW:RES? CPOW")
+    first_field = cpow_str.split(",")[0].strip()
+    cpow = float(first_field)
+
+    print(f"[RESULT] 主载波 {f0_hz/1e9:.4f} GHz, 20MHz 通道功率 = {cpow:.2f} dBm")
+
+    inst.check_error("after CPOW")
+
+    return cpow
+
+
+def _load_gui_client_class():
+    gui_path = Path(__file__).parent / "GUI control" / "GUI_control.py"
+    spec = importlib.util.spec_from_file_location("gui_control", str(gui_path))
+    if not spec or not spec.loader:
+        raise RuntimeError("Failed to load GUI_control.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.GuiSocketClient
+
+def _parse_power_value(resp: str) -> float:
+    if not resp:
+        raise ValueError("Empty POWER_GET response")
+    cleaned = resp.replace(",", " ").strip()
+    for token in reversed(cleaned.split()):
+        try:
+            return float(token)
+        except ValueError:
+            continue
+    raise ValueError(f"Unable to parse POWER_GET response: {resp!r}")
+
+def _sleep_cmd(delay_s: float) -> None:
+    if delay_s > 0:
+        time.sleep(delay_s)
+
+def measure_cpow_with_power_calibration(
+    inst: FsvSocket,
+    gui,
+    f0_hz: float,
+    tolerance_db: float = 0.5,
+    step_db: float = 0.25,
+    max_iters: int = 20,
+    control_tx: bool = True,
+    desired_target: Optional[float] = None,
+    cmd_delay: float = 0.0,
+    loss_table: Optional[List[Tuple[float, float, float]]] = None,
+) -> Tuple[float, float, float]:
+    """
+    Sequence: POWER_GET -> START_TX -> CPOW measure -> optional calibration -> STOP_TX.
+    Returns (Power_Target, Pwr, Pwr_Tar).
+    """
+    resp = gui.power_get()
+    _sleep_cmd(cmd_delay)
+    if desired_target is None:
+        desired_target = _parse_power_value(resp)
+    if desired_target is None:
+        raise ValueError("Missing desired power target")
+    current_target = desired_target
+    gui.power_target(current_target)
+    _sleep_cmd(cmd_delay)
+    if control_tx:
+        gui.start_tx()
+        _sleep_cmd(cmd_delay)
+        if TX_START_STABLE_S > 0:
+            time.sleep(TX_START_STABLE_S)
+    try:
+        cpow = measure_cpow_20m(inst, f0_hz, loss_table=loss_table)
+        if abs(cpow - desired_target) > tolerance_db:
+            # First jump: adjust by full delta, then fine-tune with 0.25 dB steps.
+            current_target = desired_target + (desired_target - cpow)
+            current_target = round(current_target / step_db) * step_db
+            gui.power_target(current_target)
+            _sleep_cmd(cmd_delay)
+            cpow = measure_cpow_20m(inst, f0_hz, loss_table=loss_table)
+            if abs(cpow - desired_target) > tolerance_db:
+                for _ in range(max_iters):
+                    if cpow < desired_target:
+                        current_target += step_db
+                    else:
+                        current_target -= step_db
+                    current_target = round(current_target / step_db) * step_db
+                    gui.power_target(current_target)
+                    _sleep_cmd(cmd_delay)
+                    cpow = measure_cpow_20m(inst, f0_hz, loss_table=loss_table)
+                    if abs(cpow - desired_target) <= tolerance_db:
+                        break
+        final_target = _parse_power_value(gui.power_get())
+        _sleep_cmd(cmd_delay)
+        return desired_target, cpow, final_target
+    finally:
+        if control_tx:
+            gui.stop_tx()
+            _sleep_cmd(cmd_delay)
+
+def _normalize_key(key: str) -> Optional[str]:
+    cleaned = key.strip().upper().replace("_", " ")
+    return KEY_ALIASES.get(cleaned)
+
+def _parse_chan(value: str) -> Optional[int]:
+    raw = value.strip()
+    if not raw:
+        return None
+    upper = raw.upper()
+    if upper.startswith("CH"):
+        raw = raw[2:]
+    try:
+        return int(float(raw))
+    except ValueError:
+        return None
+
+def _parse_config_cell(cell: str, out: Dict[str, object]) -> None:
+    if ":" not in cell and "：" not in cell:
+        return
+    if ":" in cell:
+        key, value = cell.split(":", 1)
+    else:
+        key, value = cell.split("：", 1)
+    norm = _normalize_key(key)
+    if not norm:
+        return
+    val = value.strip()
+    if not val:
+        return
+    if norm == "CHAN":
+        chan = _parse_chan(val)
+        if chan is not None:
+            out[norm] = chan
+        return
+    if norm == "CONNECT_TYPE":
+        out[norm] = val.upper()
+        return
+    if norm == "ANTENNA":
+        out[norm] = val.upper()
+        return
+    if norm == "CERTIFICATION_MODE":
+        out[norm] = val.upper()
+        return
+    if norm == "OFFSET":
+        try:
+            out[norm] = float(val)
+        except ValueError:
+            pass
+        return
+    if norm in {"DUTY_CYCLE", "PSDU_LEN"}:
+        try:
+            out[norm] = int(float(val))
+        except ValueError:
+            pass
+        return
+    out[norm] = val
+
+def _is_config_header_row(row: List[str]) -> bool:
+    for cell in row:
+        if cell is None:
+            continue
+        cell_str = str(cell).strip()
+        if not cell_str:
+            continue
+        if ":" in cell_str:
+            return False
+        if cell_str.upper() == "CH":
+            return False
+    normalized = 0
+    for cell in row:
+        if cell is None:
+            continue
+        cell_str = str(cell).strip()
+        if not cell_str:
+            continue
+        if _normalize_key(cell_str):
+            normalized += 1
+    return normalized >= 2
+
+def _apply_config_header_row(header: List[str], row: List[str], out: Dict[str, object]) -> None:
+    for i, key in enumerate(header):
+        if key is None:
+            continue
+        key_str = str(key).strip()
+        if not key_str:
+            continue
+        norm = _normalize_key(key_str)
+        if not norm:
+            continue
+        val = row[i] if i < len(row) else ""
+        if val is None:
+            continue
+        val_str = str(val).strip()
+        if not val_str:
+            continue
+        if norm == "CHAN":
+            chan = _parse_chan(val_str)
+            if chan is not None:
+                out[norm] = chan
+            continue
+        if norm == "OFFSET":
+            try:
+                out[norm] = float(val_str)
+            except ValueError:
+                pass
+            continue
+        if norm in {"DUTY_CYCLE", "PSDU_LEN"}:
+            try:
+                out[norm] = int(float(val_str))
+            except ValueError:
+                pass
+            continue
+        out[norm] = val_str
+
+def _normalize_connect_type(value: str) -> Optional[str]:
+    cleaned = value.strip().upper()
+    return cleaned or None
+
+
+def _prompt_dut_name() -> str:
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        name = simpledialog.askstring("Input DUT", "Input DUT name (e.g. oceanus):")
+        root.destroy()
+        return (name or "").strip()
+    except Exception:
+        try:
+            return input("Input DUT name (e.g. oceanus): ").strip()
+        except Exception:
+            return ""
+
+
+def _read_table_rows(path: str) -> List[List[str]]:
+    ext = Path(path).suffix.lower()
+    if ext == ".xlsx":
+        try:
+            from openpyxl import load_workbook
+        except Exception as exc:
+            raise RuntimeError("openpyxl is required to read .xlsx files") from exc
+        wb = load_workbook(path, data_only=True)
+        ws = wb.active
+        rows: List[List[str]] = []
+        for row in ws.iter_rows(values_only=True):
+            rows.append(["" if cell is None else str(cell) for cell in row])
+        return rows
+    with open(path, "r", newline="") as f:
+        return list(csv.reader(f))
+
+
+def _write_table_rows(path: str, rows: List[List[str]], template_path: Optional[str] = None) -> None:
+    ext = Path(path).suffix.lower()
+    if ext == ".xlsx":
+        try:
+            from openpyxl import Workbook
+        except Exception as exc:
+            raise RuntimeError("openpyxl is required to write .xlsx files") from exc
+        wb = Workbook()
+        ws = wb.active
+        for row in rows:
+            ws.append(list(row))
+        wb.save(path)
+        if template_path:
+            _apply_xlsx_style(path, template_path)
+        return
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerows(rows)
+
+
+def _apply_xlsx_style(output_path: str, template_path: str) -> None:
+    if not os.path.exists(template_path):
+        return
+    try:
+        from openpyxl import load_workbook
+    except Exception:
+        return
+    tpl_wb = None
+    out_wb = None
+    try:
+        tpl_wb = load_workbook(template_path)
+        tpl_ws = tpl_wb.active
+        out_wb = load_workbook(output_path)
+        out_ws = out_wb.active
+
+        for col_letter, dim in tpl_ws.column_dimensions.items():
+            if dim.width:
+                out_ws.column_dimensions[col_letter].width = dim.width
+
+        default_cell = tpl_ws.cell(1, 1)
+
+        for row in out_ws.iter_rows():
+            for cell in row:
+                if cell.value is None:
+                    continue
+                tpl_cell = tpl_ws.cell(cell.row, cell.column)
+                src = tpl_cell if tpl_cell.value is not None else default_cell
+                cell.font = copy(src.font)
+                cell.fill = copy(src.fill)
+                cell.border = copy(src.border)
+                cell.alignment = copy(src.alignment)
+                cell.number_format = src.number_format
+
+        out_wb.save(output_path)
+    finally:
+        if tpl_wb is not None:
+            try:
+                tpl_wb.close()
+            except Exception:
+                pass
+        if out_wb is not None:
+            try:
+                out_wb.close()
+            except Exception:
+                pass
+
+
+def _ensure_xlsx_support(paths: List[str]) -> bool:
+    needs_xlsx = any(Path(p).suffix.lower() == ".xlsx" for p in paths)
+    if not needs_xlsx:
+        return True
+    try:
+        import openpyxl  # noqa: F401
+    except Exception:
+        print("[ERROR] openpyxl is required to read/write .xlsx files.")
+        print("[ERROR] Install it with: pip install openpyxl")
+        return False
+    return True
+
+
+def _load_cable_loss_table(path: str) -> List[Tuple[float, float, float]]:
+    if not os.path.exists(path):
+        return []
+    pattern = re.compile(
+        r"^CableLoss(?P<start>\d+(?:\.\d+)?)_(?P<end>\d+(?:\.\d+)?)G\s*=\s*(?P<loss>-?\d+(?:\.\d+)?)\s*$",
+        re.IGNORECASE,
+    )
+    table: List[Tuple[float, float, float]] = []
+    with open(path, "r", newline="") as f:
+        for line in f:
+            raw = line.strip()
+            if not raw or raw.startswith("#"):
+                continue
+            match = pattern.match(raw)
+            if not match:
+                continue
+            start_ghz = float(match.group("start"))
+            end_ghz = float(match.group("end"))
+            loss_db = float(match.group("loss"))
+            table.append((start_ghz * 1e9, end_ghz * 1e9, loss_db))
+    return table
+
+
+def _lookup_cable_loss_db(
+    freq_hz: float,
+    table: List[Tuple[float, float, float]],
+) -> Optional[float]:
+    for start_hz, end_hz, loss_db in table:
+        if start_hz <= freq_hz < end_hz:
+            return loss_db
+    for start_hz, end_hz, loss_db in table:
+        if abs(freq_hz - end_hz) < 1e-6:
+            return loss_db
+    return None
+
+
+def _load_global_csv_settings(
+    path: str,
+) -> Tuple[Optional[str], Optional[int], Optional[str], Optional[str]]:
+    try:
+        rows = _read_table_rows(path)
+        if Path(path).suffix.lower() == ".xlsx":
+            header = None
+            values = None
+            for row in rows:
+                if not row or all(not str(c).strip() for c in row):
+                    continue
+                if header is None:
+                    header = row
+                    continue
+                values = row
+                break
+            if header and values:
+                host = None
+                port = None
+                connect_type = None
+                gui_exe_path = None
+                for i, key in enumerate(header):
+                    key_str = str(key).strip()
+                    if not key_str:
+                        continue
+                    key_clean = key_str.upper().replace("_", " ")
+                    val = ""
+                    if i < len(values):
+                        val = str(values[i]).strip()
+                    if not val:
+                        continue
+                    if key_clean == "GUI ADDRESS":
+                        gui_exe_path = val
+                    elif key_clean == "GUI HOST":
+                        host = val
+                    elif key_clean == "GUI PORT":
+                        try:
+                            port = int(float(val))
+                        except ValueError:
+                            pass
+                    elif key_clean == "CONNECT TYPE":
+                        connect_type = val.strip().upper()
+                if host or port or connect_type or gui_exe_path:
+                    return host, port, connect_type, gui_exe_path
+        for row in rows:
+            if not row or all(not str(c).strip() for c in row):
+                continue
+            host = None
+            port = None
+            connect_type = None
+            for cell in row:
+                cell_str = str(cell).strip()
+                if ":" not in cell_str:
+                    continue
+                key, value = cell_str.split(":", 1)
+                key_clean = key.strip().upper().replace("_", " ")
+                val = value.strip()
+                if not val:
+                    continue
+                if key_clean == "GUI HOST":
+                    host = val
+                elif key_clean == "GUI PORT":
+                    try:
+                        port = int(float(val))
+                    except ValueError:
+                        pass
+                elif key_clean == "CONNECT TYPE":
+                    connect_type = val.strip().upper()
+            return host, port, connect_type, None
+        return None, None, None, None
+    except FileNotFoundError:
+        return None, None, None, None
+
+
+def _parse_harmonic_label(label: str) -> Optional[Tuple[float, str]]:
+    raw = label.strip()
+    if not raw:
+        return None
+    if "/" in raw:
+        try:
+            return float(Fraction(raw)), raw
+        except Exception:
+            return None
+    low = raw.lower()
+    for suffix in ("st", "nd", "rd", "th"):
+        if low.endswith(suffix):
+            raw = raw[:-len(suffix)]
+            break
+    try:
+        return float(raw), label
+    except ValueError:
+        return None
+
+def _build_tx_config_cmd(config: Dict[str, object]) -> str:
+    return (
+        "TX_CONFIG "
+        f"CHAN {config['CHAN']} "
+        f"BW {config['BW']} "
+        f"OFFSET {config['OFFSET']} "
+        f"MODE {config['MODE']} "
+        f"OFDM_MODE {config['OFDM_MODE']} "
+        f"RATE {config['RATE']} "
+        f"CODING {config['CODING']} "
+        f"DUTY_CYCLE {config['DUTY_CYCLE']} "
+        f"PSDU_LEN {config['PSDU_LEN']}"
+    )
+
+def _extract_harmonic_columns(header: List[str]) -> List[Tuple[float, str]]:
+    known = {"CH", "FREQ", "PWR", "PWRTAR"}
+    results: List[Tuple[float, str]] = []
+    for col in header:
+        if not col:
+            continue
+        upper = col.strip().upper()
+        if upper in known:
+            continue
+        if _normalize_key(col):
+            continue
+        parsed = _parse_harmonic_label(col)
+        if parsed:
+            results.append(parsed)
+    return results
+
+def _get_cell(row_map: Dict[str, str], key: str) -> str:
+    for k, v in row_map.items():
+        if k.strip().upper() == key.upper():
+            return v
+    return ""
+
+def run_csv_test(
+    input_path: str,
+    output_path: str,
+    inst: FsvSocket,
+    gui,
+    default_connect_type: Optional[str] = None,
+    cable_loss_table: Optional[List[Tuple[float, float, float]]] = None,
+) -> None:
+    rows_out: List[List[str]] = []
+    base_defaults = dict(DEFAULT_TX_CONFIG)
+    if default_connect_type:
+        base_defaults["CONNECT_TYPE"] = default_connect_type
+    defaults = dict(base_defaults)
+    header: Optional[List[str]] = None
+    harmonics: List[Tuple[float, str]] = []
+    pending_config_header: Optional[List[str]] = None
+    current_connect_type: Optional[str] = None
+    current_antenna: Optional[str] = None
+    current_cert_mode: Optional[str] = None
+    loss_table = cable_loss_table or []
+
+    rows = _read_table_rows(input_path)
+    for row in rows:
+        if not row or all(not c.strip() for c in row):
+            rows_out.append(row)
+            continue
+
+        if pending_config_header is not None:
+            defaults = dict(base_defaults)
+            _apply_config_header_row(pending_config_header, row, defaults)
+            header = None
+            harmonics = []
+            pending_config_header = None
+            rows_out.append(row)
+            continue
+
+        if any(":" in c for c in row):
+            defaults = dict(base_defaults)
+            for cell in row:
+                _parse_config_cell(cell, defaults)
+            header = None
+            harmonics = []
+            rows_out.append(row)
+            continue
+
+        if _is_config_header_row(row):
+            pending_config_header = row
+            rows_out.append(row)
+            continue
+
+        if row[0].strip().upper() == "CH":
+            header = [c.strip() for c in row]
+            harmonics = _extract_harmonic_columns(header)
+            rows_out.append(header)
+            continue
+
+        if not header:
+            rows_out.append(row)
+            continue
+
+        row_map = {header[i]: row[i].strip() if i < len(row) else "" for i in range(len(header))}
+        if not _get_cell(row_map, "CH"):
+            rows_out.append(row)
+            continue
+
+        config = dict(defaults)
+        for col, val in row_map.items():
+            if not val:
+                continue
+            norm = _normalize_key(col)
+            if not norm:
+                continue
+            if norm == "CHAN":
+                chan = _parse_chan(val)
+                if chan is not None:
+                    config[norm] = chan
+                continue
+            if norm == "OFFSET":
+                try:
+                    config[norm] = float(val)
+                except ValueError:
+                    pass
+                continue
+            if norm in {"DUTY_CYCLE", "PSDU_LEN"}:
+                try:
+                    config[norm] = int(float(val))
+                except ValueError:
+                    pass
+                continue
+            config[norm] = val
+
+        freq_cell = _get_cell(row_map, "Freq")
+        if not freq_cell:
+            rows_out.append(row)
+            continue
+        try:
+            f0_hz = float(freq_cell) * 1e6
+        except ValueError:
+            rows_out.append(row)
+            continue
+
+        started_tx = False
+        if gui:
+            connect_type = _normalize_connect_type(str(config.get("CONNECT_TYPE", "")))
+            if connect_type and connect_type != current_connect_type:
+                gui.send(f"CONNECT TYPE {connect_type}")
+                _sleep_cmd(CMD_DELAY)
+                current_connect_type = connect_type
+            antenna = str(config.get("ANTENNA", "")).strip().upper()
+            if antenna:
+                if antenna not in {"ANT1", "ANT2", "ALL"}:
+                    raise ValueError(f"Invalid ANTENNA value: {antenna!r}")
+                if antenna != current_antenna:
+                    gui.send(f"ANTENNA ANT {antenna}")
+                    _sleep_cmd(CMD_DELAY)
+                    current_antenna = antenna
+            cert_mode = str(config.get("CERTIFICATION_MODE", "")).strip().upper()
+            if cert_mode:
+                if cert_mode not in {"NORMAL", "CE", "FCC", "SRRC", "SRRC_2"}:
+                    raise ValueError(f"Invalid CERTIFICATION MODE value: {cert_mode!r}")
+                if cert_mode != current_cert_mode:
+                    gui.send(f"CERTIFICATION MODE {cert_mode}")
+                    _sleep_cmd(CMD_DELAY)
+                    current_cert_mode = cert_mode
+            gui.send(_build_tx_config_cmd(config))
+            _sleep_cmd(CMD_DELAY)
+            gui.start_tx()
+            _sleep_cmd(CMD_DELAY)
+            started_tx = True
+            if SIMPLE_GUI_FLOW:
+                print("[INFO] SIMPLE_GUI_FLOW enabled: only TX_CONFIG -> START_TX, then stop.")
+                return
+            if STOP_AFTER_START_TX:
+                print("[INFO] STOP_AFTER_START_TX enabled: press Enter to continue (TX stays on).")
+                try:
+                    input()
+                except KeyboardInterrupt:
+                    print()
+                return
+            cal_pwr_cell = _get_cell(row_map, "Cal Pwr") or _get_cell(row_map, "Cal Power")
+            desired_target = None
+            if cal_pwr_cell:
+                try:
+                    desired_target = float(cal_pwr_cell)
+                except Exception:
+                    desired_target = None
+            if desired_target is None:
+                ch_cell = _get_cell(row_map, "CH")
+                raise ValueError(f"Missing or invalid Cal Pwr for CH={ch_cell!r}")
+            power_target, cpow, power_tar_final = measure_cpow_with_power_calibration(
+                inst,
+                gui,
+                f0_hz,
+                control_tx=False,
+                desired_target=desired_target,
+                cmd_delay=CMD_DELAY,
+                loss_table=loss_table,
+            )
+            row_map["Pwr"] = f"{cpow:.1f}"
+            row_map["PwrTar"] = f"{power_tar_final:.1f}"
+            if STOP_AFTER_CALIBRATION:
+                print("[INFO] STOP_AFTER_CALIBRATION enabled: current TX config and targets.")
+                print(f"[INFO] TX_CONFIG: {config}")
+                print(f"[INFO] Cal Pwr={desired_target} Pwr={cpow:.1f} PwrTar={power_tar_final:.1f}")
+                return
+        else:
+            cpow = measure_cpow_20m(inst, f0_hz, loss_table=loss_table)
+            row_map["Pwr"] = f"{cpow:.1f}"
+
+        try:
+            if harmonics:
+                inst.query("SENS:FREQ:SPAN?")
+                orders = [h[0] for h in harmonics]
+                order_strs = [h[1] for h in harmonics]
+                harm_results = measure_all_harmonics(
+                    inst,
+                    f0_hz,
+                    MAX_FREQ_HZ,
+                    [25, 20, 15],
+                    orders=orders,
+                    orders_str=order_strs,
+                    loss_table=loss_table,
+                )
+                inst.query("SENS:FREQ:SPAN?")
+                for item in harm_results:
+                    key = item.get("order_str", str(item["order"]))
+                    row_map[key] = f"{item['best']['power']:.1f}"
+        finally:
+            if gui and started_tx:
+                gui.stop_tx()
+
+        out_row = [row_map.get(col, "") for col in header]
+        rows_out.append(out_row)
+
+    _write_table_rows(output_path, rows_out, template_path=input_path)
+
+
+def measure_one_harmonic(
+    inst: FsvSocket,
+    f0_hz: float,
+    order: float,
+    att_list: List[int],
+    span_hz: float = 100e6,
+    ref_level_dbm: float = 10.0,
+    order_str: Optional[str] = None,
+    loss_table: Optional[List[Tuple[float, float, float]]] = None,
+) -> Dict[str, Any]:
+    """
+    测某一个谐波 n*f0：
+      - 多个 ATT 尝试
+      - 每个 ATT：扫一枪 + Marker MAX
+      - 返回每个 ATT 结果 + 选出的最大值
+    """
+    f_center = f0_hz * order
+    display_order = order_str if order_str is not None else str(order)
+    print(f"\n===== Step2: {display_order} 次谐波，中心 ≈ {f_center/1e9:.6f} GHz =====")
+
+    # 切回普通扫频模式（离开 CPOW / ACP 等测量 app）
+    inst.send_cmd("SENS:FREQ:MODE SWE")
+    inst.send_cmd("INIT:CONT OFF")
+
+    inst.send_cmd(f"SENS:FREQ:CENT {f_center:.0f}")
+    inst.send_cmd(f"SENS:FREQ:SPAN {int(span_hz)}")
+
+    # RBW / VBW = 1MHz（重申一遍也没问题）
+    inst.send_cmd("SENS:BAND:AUTO OFF")
+    inst.send_cmd("SENS:BAND 1MHz")
+    inst.send_cmd("SENS:BAND:VID:AUTO OFF")
+    inst.send_cmd("SENS:BAND:VID 1MHz")
+
+    # Detector：RMS（可按需要改成 POS）
+    inst.send_cmd("SENS:WIND:DET1:FUNC RMS")
+
+    inst.send_cmd(f"DISP:WIND:TRAC:Y:SCAL:RLEV {ref_level_dbm}")
+    if loss_table:
+        loss_db = _lookup_cable_loss_db(f_center, loss_table)
+        if loss_db is not None:
+            inst.send_cmd(f"DISP:WIND:TRAC:Y:SCAL:RLEV:OFFS {loss_db}")
+    inst.send_cmd("INP:ATT:AUTO OFF")
+
+    inst.send_cmd("CALC:MARK1:STAT ON")
+
+    per_att_results: List[Dict[str, float]] = []
+
+    for att in att_list:
+        print(f"[ATT LOOP] ATT = {att} dB")
+        inst.send_cmd(f"INP:ATT {att}")
+
+        inst.send_cmd("INIT:IMM")
+        inst.send_cmd("*WAI")
+
+        inst.send_cmd("CALC:MARK1:MAX")
+
+        f_peak = inst.query_float("CALC:MARK1:X?")
+        p_peak = inst.query_float("CALC:MARK1:Y?")
+
+        inst.check_error(f"harmonic {order}, ATT={att}")
+
+        per_att_results.append({
+            "atten": att,
+            "freq": f_peak,
+            "power": p_peak,
+        })
+
+        print(f"  → 峰值: {f_peak/1e9:.6f} GHz, {p_peak:.2f} dBm")
+
+    # 选功率最小的那一组
+    best = min(per_att_results, key=lambda r: r["power"])
+
+    display_order = order_str if order_str is not None else str(order)
+    print(
+        f"[BEST] {display_order} 次谐波: "
+        f"ATT={best['atten']} dB, "
+        f"f_peak={best['freq']/1e9:.6f} GHz, "
+        f"P_peak={best['power']:.2f} dBm"
+    )
+
+    return {
+        "order": order,
+        "order_str": order_str if order_str is not None else str(order),
+        "center": f_center,
+        "per_atten": per_att_results,
+        "best": best,
+    }
+
+
+def measure_all_harmonics(
+    inst: FsvSocket,
+    f0_hz: float,
+    max_freq_hz: float,
+    att_list: List[int],
+    orders: Optional[List[float]] = None,
+    orders_str: Optional[List[str]] = None,
+    loss_table: Optional[List[Tuple[float, float, float]]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    如果指定 orders（如 [2,3,4.5]），只测这些阶数（不限制频率上限）。
+    否则默认从 2 次开始依次测到 n*f0 > max_freq_hz 为止。
+    """
+    results: List[Dict[str, Any]] = []
+    if orders:
+        # 手动输入谐波时，不限制频率上限
+        for i, order in enumerate(orders):
+            order_str = orders_str[i] if orders_str and i < len(orders_str) else None
+            res = measure_one_harmonic(
+                inst,
+                f0_hz,
+                order,
+                att_list,
+                order_str=order_str,
+                loss_table=loss_table,
+            )
+            results.append(res)
+    else:
+        # 自动模式时，限制到 max_freq_hz
+        order = 2
+        while True:
+            f_harm = f0_hz * order
+            if f_harm > max_freq_hz:
+                break
+            res = measure_one_harmonic(
+                inst,
+                f0_hz,
+                order,
+                att_list,
+                loss_table=loss_table,
+            )
+            results.append(res)
+            order += 1
+    return results
+
+
+
+def export_simple_csv(
+    filename: str,
+    f0_hz: float,
+    cpow: float,
+    harm_results: List[Dict[str, Any]]
+):
+    """
+    导出一个很简单的 CSV（Excel 可直接打开）：
+
+    表头格式：Freq_GHz, CPOW_dBm, H2_dBm, H3_dBm, ...
+    数据行：本次测试对应的数值，频率保留 3 位小数，功率保留 1 位小数。
+
+    表头逻辑：
+      - 如果文件不存在：写表头 + 数据
+      - 如果文件存在：只和“最近一次写入的表头”（最后一行中是表头的那行）比较谐波列：
+          * 若谐波列相同 → 只追加数据行，不写新表头
+          * 若谐波列不同 → 先写新表头，再写数据行
+    """
+
+    order_list = [item["order"] for item in harm_results]
+    order_str_list = [item.get("order_str", str(item["order"])) for item in harm_results]
+    headers = ["Freq_GHz", "CPOW_dBm"] + [
+        f"H{order_str}_dBm" for order_str in order_str_list
+    ]
+
+    order2power = {
+        item["order"]: round(item["best"]["power"], 1)
+        for item in harm_results
+    }
+
+    freq_ghz = round(f0_hz / 1e9, 3)
+    cpow_1 = round(cpow, 1)
+    row = [freq_ghz, cpow_1] + [order2power.get(order, "") for order in order_list]
+
+    file_exists = os.path.exists(filename)
+    need_write_header = False
+    rows_out: List[List[str]] = []
+
+    if file_exists:
+        try:
+            rows_out = _read_table_rows(filename)
+
+            last_header = None
+            for r in reversed(rows_out):
+                if len(r) >= 2 and r[0] == "Freq_GHz" and r[1] == "CPOW_dBm":
+                    last_header = r
+                    break
+
+            if last_header is None:
+                need_write_header = True
+            else:
+                existing_harm_cols = last_header[2:] if len(last_header) > 2 else []
+                new_harm_cols = headers[2:]
+                if existing_harm_cols != new_harm_cols:
+                    need_write_header = True
+                else:
+                    need_write_header = False
+
+        except Exception as e:
+            print(f"[WARN] Failed to read existing result file: {e}; will write a new header.")
+            need_write_header = True
+    else:
+        need_write_header = True
+
+    if need_write_header:
+        rows_out.append(headers)
+    rows_out.append(row)
+
+    _write_table_rows(filename, rows_out)
+
+    print(f"\n[FILE] Wrote file: {filename}")
+    print("[FILE] Wrote header:", "yes" if need_write_header else "no")
+    print("[FILE] Header:", ",".join(headers))
+    print("[FILE] Row:", ",".join(str(x) for x in row))
+
+
+def _get_base_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent
+    return Path(__file__).parent
+
+
+def _get_config_dir() -> Path:
+    return _get_base_dir() / CONFIG_DIR_NAME
+
+
+def _get_result_dir() -> Path:
+    return _get_base_dir() / RESULT_DIR_NAME
+
+
+def _resolve_config_resource(name: str) -> Path:
+    base_dir = _get_base_dir()
+    config_dir = base_dir / CONFIG_DIR_NAME
+    candidate = config_dir / name
+    if candidate.exists():
+        return candidate
+    fallback = base_dir / name
+    if fallback.exists():
+        return fallback
+    bundle_root = Path(getattr(sys, "_MEIPASS", base_dir))
+    candidate = bundle_root / CONFIG_DIR_NAME / name
+    if candidate.exists():
+        return candidate
+    return bundle_root / name
+
+
+def main():
+    inst = FsvSocket(FSV_IP, FSV_PORT, SOCKET_TIMEOUT)
+    gui = None
+    gui_proc = None
+    if not _ensure_xlsx_support([INPUT_CSV, OUTPUT_CSV]):
+        return
+    input_path = _resolve_config_resource(INPUT_CSV)
+    csv_gui_host, csv_gui_port, csv_connect_type, csv_gui_exe_path = _load_global_csv_settings(
+        str(input_path)
+    )
+    base_dir = _get_base_dir()
+    config_dir = _get_config_dir()
+    config_dir.mkdir(parents=True, exist_ok=True)
+    result_dir = _get_result_dir()
+    result_dir.mkdir(parents=True, exist_ok=True)
+    output_path = str(result_dir / OUTPUT_CSV)
+    dut_name = _prompt_dut_name()
+    if dut_name:
+        output_path = str(result_dir / f"{dut_name}_{OUTPUT_CSV}")
+    loss_path = _resolve_config_resource(LOSS_TABLE_PATH)
+    cable_loss_table = _load_cable_loss_table(str(loss_path))
+    if cable_loss_table:
+        print(f"[INFO] Cable loss table loaded: {len(cable_loss_table)} ranges from {loss_path}")
+    else:
+        print(f"[WARN] Cable loss table is empty or missing: {loss_path}")
+    gui_host = csv_gui_host or GUI_HOST
+    gui_port = csv_gui_port or GUI_PORT
+    gui_exe_path = csv_gui_exe_path or GUI_EXE_PATH
+    if USE_GUI_CALIBRATION:
+        GuiSocketClient = _load_gui_client_class()
+        gui = GuiSocketClient(gui_host, gui_port, GUI_TIMEOUT, trailing_space=True, log_io=False)
+
+    try:
+        if AUTO_LAUNCH_GUI and gui_exe_path:
+            exe_path = Path(gui_exe_path)
+            config_path = exe_path.parent / "Config" / "main.ini"
+            if not config_path.exists():
+                print(f"[WARN] GUI config not found: {config_path}")
+            original_cwd = os.getcwd()
+            os.chdir(str(exe_path.parent))
+            gui_proc = subprocess.Popen([str(exe_path)])
+            time.sleep(2.0)
+            os.chdir(original_cwd)
+        if gui:
+            start_time = time.time()
+            while True:
+                try:
+                    gui.connect()
+                    break
+                except Exception as exc:
+                    if time.time() - start_time > 20:
+                        raise
+                    print(f"[WARN] GUI connect failed, retrying: {exc}")
+                    time.sleep(1.0)
+        inst.connect()
+        idn = inst.query("*IDN?")
+        print("[IDN]", idn)
+
+        run_csv_test(
+            str(input_path),
+            output_path,
+            inst,
+            gui,
+            default_connect_type=csv_connect_type,
+            cable_loss_table=cable_loss_table,
+        )
+
+    finally:
+        if gui:
+            try:
+                try:
+                    gui_version = gui.get_version()
+                    version_text = str(gui_version).strip() or "(empty)"
+                    print(f"[RESULT] GUI GET_VERSION: {version_text}")
+                    try:
+                        rows = _read_table_rows(output_path) if os.path.exists(output_path) else []
+                        rows.append(["GET_VERSION", version_text])
+                        _write_table_rows(output_path, rows, template_path=str(input_path))
+                    except Exception as exc:
+                        print(f"[WARN] Failed to write GET_VERSION to result: {exc}")
+                except Exception as exc:
+                    print(f"[WARN] GUI GET_VERSION failed: {exc}")
+                print("[GUI] DISCONNECT")
+                gui.disconnect()
+                _sleep_cmd(CMD_DELAY)
+            except Exception:
+                pass
+            gui.close()
+        inst.close()
+        if gui_proc and gui_proc.poll() is None:
+            try:
+                gui_proc.terminate()
+                gui_proc.wait(timeout=5)
+            except Exception:
+                try:
+                    gui_proc.kill()
+                except Exception:
+                    pass
+if __name__ == "__main__":
+    main()
