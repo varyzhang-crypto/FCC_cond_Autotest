@@ -71,6 +71,7 @@ DEFAULT_TX_CONFIG: Dict[str, object] = {
     "CERTIFICATION_MODE": "",
     "GPIO20": None,
     "GPIO21": None,
+    "FIRMWARE_TYPE": "WIFI",
 }
 
 KEY_ALIASES = {
@@ -93,7 +94,11 @@ KEY_ALIASES = {
     "CERTIFICATION_MODE": "CERTIFICATION_MODE",
     "GPIO20": "GPIO20",
     "GPIO21": "GPIO21",
+    "FIRMWARE TYPE": "FIRMWARE_TYPE",
+    "FIRMWARE_TYPE": "FIRMWARE_TYPE",
 }
+
+FIRMWARE_TYPES = {"WIFI", "BLE", "WIFI_AND_BLE"}
 
 F0_HZ_DEFAULT = 2.412e9      # 默认 2412 MHz 基波
 MAX_FREQ_HZ = 18e9           # 谐波最高测到 18 GHz
@@ -551,6 +556,7 @@ def _prompt_user_inputs() -> Tuple[
     bool,
     bool,
     str,
+    str,
 ]:
     try:
         root = tk.Tk()
@@ -573,45 +579,57 @@ def _prompt_user_inputs() -> Tuple[
             row=2, column=1, columnspan=3, sticky="w", padx=12, pady=(4, 4)
         )
 
-        tk.Label(dialog, text="Profile:").grid(row=3, column=0, sticky="w", padx=12, pady=(4, 4))
-        profile_var = tk.StringVar(value="SINGLE_BAND")
-        tk.Radiobutton(dialog, text="SINGLE_BAND", variable=profile_var, value="SINGLE_BAND").grid(
-            row=4, column=0, sticky="w", padx=12
+        tk.Label(dialog, text="Firmware type:").grid(row=3, column=0, sticky="w", padx=12, pady=(4, 4))
+        firmware_type_var = tk.StringVar(value="WIFI")
+        tk.Radiobutton(dialog, text="WIFI", variable=firmware_type_var, value="WIFI").grid(
+            row=3, column=1, sticky="w", padx=12
         )
-        tk.Radiobutton(dialog, text="DULE_BAND", variable=profile_var, value="DULE_BAND").grid(
-            row=4, column=1, sticky="w", padx=12
+        tk.Radiobutton(dialog, text="BT", variable=firmware_type_var, value="BLE").grid(
+            row=3, column=2, sticky="w", padx=12
         )
-        tk.Radiobutton(dialog, text="Dule_Antenna", variable=profile_var, value="Dule_Antenna").grid(
-            row=4, column=2, sticky="w", padx=12
+        tk.Radiobutton(dialog, text="WIFI+BT", variable=firmware_type_var, value="WIFI_AND_BLE").grid(
+            row=3, column=3, sticky="w", padx=12
         )
 
-        tk.Label(dialog, text="Band:").grid(row=5, column=0, sticky="w", padx=12, pady=(6, 4))
+        tk.Label(dialog, text="Profile:").grid(row=4, column=0, sticky="w", padx=12, pady=(4, 4))
+        profile_var = tk.StringVar(value="SINGLE_BAND")
+        tk.Radiobutton(dialog, text="SINGLE_BAND", variable=profile_var, value="SINGLE_BAND").grid(
+            row=5, column=0, sticky="w", padx=12
+        )
+        tk.Radiobutton(dialog, text="DULE_BAND", variable=profile_var, value="DULE_BAND").grid(
+            row=5, column=1, sticky="w", padx=12
+        )
+        tk.Radiobutton(dialog, text="Dule_Antenna", variable=profile_var, value="Dule_Antenna").grid(
+            row=5, column=2, sticky="w", padx=12
+        )
+
+        tk.Label(dialog, text="Band:").grid(row=6, column=0, sticky="w", padx=12, pady=(6, 4))
         band_24_var = tk.BooleanVar(value=True)
         band_5_var = tk.BooleanVar(value=True)
         band_24_cb = tk.Checkbutton(dialog, text="2.4G", variable=band_24_var)
-        band_24_cb.grid(row=5, column=1, sticky="w", padx=6)
+        band_24_cb.grid(row=6, column=1, sticky="w", padx=6)
         band_5_cb = tk.Checkbutton(dialog, text="5G", variable=band_5_var)
-        band_5_cb.grid(row=5, column=2, sticky="w", padx=6)
+        band_5_cb.grid(row=6, column=2, sticky="w", padx=6)
 
         enable_var = tk.BooleanVar(value=False)
         tk.Checkbutton(dialog, text="Cal Power Scope", variable=enable_var).grid(
-            row=6, column=0, columnspan=4, sticky="w", padx=12, pady=(8, 4)
+            row=7, column=0, columnspan=4, sticky="w", padx=12, pady=(8, 4)
         )
 
-        tk.Label(dialog, text="Min").grid(row=7, column=0, sticky="w", padx=12)
+        tk.Label(dialog, text="Min").grid(row=8, column=0, sticky="w", padx=12)
         min_var = tk.StringVar(value="-1")
         min_entry = tk.Entry(dialog, textvariable=min_var, width=8)
-        min_entry.grid(row=7, column=1, padx=6, pady=4)
+        min_entry.grid(row=8, column=1, padx=6, pady=4)
 
-        tk.Label(dialog, text="Max").grid(row=7, column=2, sticky="w", padx=6)
+        tk.Label(dialog, text="Max").grid(row=8, column=2, sticky="w", padx=6)
         max_var = tk.StringVar(value="0")
         max_entry = tk.Entry(dialog, textvariable=max_var, width=8)
-        max_entry.grid(row=7, column=3, padx=6, pady=4)
+        max_entry.grid(row=8, column=3, padx=6, pady=4)
 
-        tk.Label(dialog, text="Step").grid(row=8, column=0, sticky="w", padx=12)
+        tk.Label(dialog, text="Step").grid(row=9, column=0, sticky="w", padx=12)
         step_var = tk.StringVar(value="1")
         step_entry = tk.Entry(dialog, textvariable=step_var, width=8)
-        step_entry.grid(row=8, column=1, padx=6, pady=4)
+        step_entry.grid(row=9, column=1, padx=6, pady=4)
 
         tip_text = (
             "SWITCH connection:\n"
@@ -620,7 +638,7 @@ def _prompt_user_inputs() -> Tuple[
             "SMA3->ANT2, SMA4->50ohm"
         )
         tk.Label(dialog, text=tip_text, justify="left").grid(
-            row=9, column=0, columnspan=4, sticky="w", padx=12, pady=(6, 4)
+            row=10, column=0, columnspan=4, sticky="w", padx=12, pady=(6, 4)
         )
 
         def _set_state(enabled: bool) -> None:
@@ -675,6 +693,7 @@ def _prompt_user_inputs() -> Tuple[
                 bool(band_24_var.get()),
                 bool(band_5_var.get()),
                 connect_type_var.get().strip().upper(),
+                firmware_type_var.get().strip().upper(),
             )
             dialog.destroy()
 
@@ -683,7 +702,7 @@ def _prompt_user_inputs() -> Tuple[
             dialog.destroy()
 
         btn_frame = tk.Frame(dialog)
-        btn_frame.grid(row=10, column=0, columnspan=4, pady=12)
+        btn_frame.grid(row=11, column=0, columnspan=4, pady=12)
         tk.Button(btn_frame, text="OK", width=8, command=on_ok).pack(side="left", padx=6)
         tk.Button(btn_frame, text="Cancel", width=8, command=on_cancel).pack(side="left", padx=6)
 
@@ -713,6 +732,16 @@ def _prompt_user_inputs() -> Tuple[
         except Exception:
             connect_type = "USB"
         try:
+            raw_fw = input("Firmware type (WIFI/BT/BOTH) [WIFI]: ").strip().upper()
+            if raw_fw == "BT":
+                firmware_type = "BLE"
+            elif raw_fw in {"BOTH", "WIFI+BT", "WIFI_AND_BT", "WIFI_AND_BLE"}:
+                firmware_type = "WIFI_AND_BLE"
+            else:
+                firmware_type = "WIFI"
+        except Exception:
+            firmware_type = "WIFI"
+        try:
             raw = input("Select test profile (single_band/dule_band/dule_antenna): ").strip().lower()
             if raw in {"dule_antenna", "duleantenna"}:
                 profile = "Dule_Antenna"
@@ -738,7 +767,7 @@ def _prompt_user_inputs() -> Tuple[
         except Exception:
             enable = False
         if not enable:
-            return name, profile, None, None, None, band_24, band_5
+            return name, profile, None, None, None, band_24, band_5, connect_type, firmware_type
         try:
             scope_text = input("Cal Power Scope (min max, e.g. -1 0): ").strip()
             parts = scope_text.replace(",", " ").split()
@@ -752,7 +781,7 @@ def _prompt_user_inputs() -> Tuple[
             scope_step = float(step_text) if step_text else None
         except Exception:
             scope_step = None
-        return name, profile, scope_min, scope_max, scope_step, band_24, band_5, connect_type
+        return name, profile, scope_min, scope_max, scope_step, band_24, band_5, connect_type, firmware_type
 def _prompt_cal_power_scope() -> Tuple[Optional[float], Optional[float], Optional[float]]:
     try:
         root = tk.Tk()
@@ -1150,6 +1179,7 @@ def run_csv_test(
     inst: FsvSocket,
     gui,
     default_connect_type: Optional[str] = None,
+    default_firmware_type: Optional[str] = None,
     cable_loss_table: Optional[List[Tuple[float, float, float]]] = None,
     cal_scope_min: Optional[float] = None,
     cal_scope_max: Optional[float] = None,
@@ -1161,6 +1191,8 @@ def run_csv_test(
     base_defaults = dict(DEFAULT_TX_CONFIG)
     if default_connect_type:
         base_defaults["CONNECT_TYPE"] = default_connect_type
+    if default_firmware_type in FIRMWARE_TYPES:
+        base_defaults["FIRMWARE_TYPE"] = default_firmware_type
     defaults = dict(base_defaults)
     header: Optional[List[str]] = None
     harmonics: List[Tuple[float, str]] = []
@@ -1789,6 +1821,7 @@ def main():
         band_24,
         band_5,
         selected_connect_type,
+        selected_firmware_type,
     ) = _prompt_user_inputs()
     input_csv_name = INPUT_CSV_SINGLE_BAND
     loss_table_name = LOSS_TABLE_PATH
@@ -1861,6 +1894,7 @@ def main():
             inst,
             gui,
             default_connect_type=effective_connect_type,
+            default_firmware_type=selected_firmware_type,
             cable_loss_table=cable_loss_table,
             cal_scope_min=cal_scope_min,
             cal_scope_max=cal_scope_max,
