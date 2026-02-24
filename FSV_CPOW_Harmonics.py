@@ -50,7 +50,9 @@ GUI_EXE_PATH = r"E:\Altobeam GUI\WiFi6_GUI_20251223\WiFi6_GUI\AtbmWLANFacility_C
 INPUT_CSV_SINGLE_BAND = "FCC_test_item_single_band.xlsx"
 INPUT_CSV_DULE_BAND = "FCC_test_item_dule_band.xlsx"
 INPUT_CSV_DULE_ANTENNA = "FCC_test_item_Dule_Antenna.xlsx"
+INPUT_CSV_BT_BLE = "FCC_test_item_BT_BLE.xlsx"
 OUTPUT_CSV = "FCC_conduction_result.xlsx"
+OUTPUT_CSV_BT = "BT_FCC_conduction_result.xlsx"
 LOSS_TABLE_PATH = "loss.txt"
 LOSS_TABLE_PATH_DULE_ANTENNA = "loss_Dule_Antenna.txt"
 CONFIG_DIR_NAME = "config"
@@ -72,6 +74,10 @@ DEFAULT_TX_CONFIG: Dict[str, object] = {
     "GPIO20": None,
     "GPIO21": None,
     "FIRMWARE_TYPE": "WIFI",
+    "TEST_MODE": "TX",
+    "PACKET_TYPE": "BT_BLE_1M",
+    "PAYLOAD": 0,
+    "PAYLOAD_LEN": 37,
 }
 
 KEY_ALIASES = {
@@ -96,9 +102,51 @@ KEY_ALIASES = {
     "GPIO21": "GPIO21",
     "FIRMWARE TYPE": "FIRMWARE_TYPE",
     "FIRMWARE_TYPE": "FIRMWARE_TYPE",
+    "TEST MODE": "TEST_MODE",
+    "TEST_MODE": "TEST_MODE",
+    "PACKET TYPE": "PACKET_TYPE",
+    "PACKET_TYPE": "PACKET_TYPE",
+    "PAYLOAD": "PAYLOAD",
+    "PAYLOAD LEN": "PAYLOAD_LEN",
+    "PAYLOAD_LEN": "PAYLOAD_LEN",
 }
 
 FIRMWARE_TYPES = {"WIFI", "BLE", "WIFI_AND_BLE"}
+TEST_MODES = {"TX", "RX"}
+BT_PACKET_TYPES = {
+    "BT_BLE_1M",
+    "BT_BLE_2M",
+    "BT_BLE_S8",
+    "BT_BLE_S2",
+    "BT_ID",
+    "BT_NULL",
+    "BT_POLL",
+    "BT_FHS",
+    "BT_DM1",
+    "BT_DH1",
+    "BT_2_DH1",
+    "BT_HV1",
+    "BT_HV2",
+    "BT_2_EV3",
+    "BT_HV3",
+    "BT_EV3",
+    "BT_3_EV3",
+    "BT_DV",
+    "BT_3_DH1",
+    "BT_AUX1",
+    "BT_DM3",
+    "BT_2_DH3",
+    "BT_DH3",
+    "BT_3_DH3",
+    "BT_EV4",
+    "BT_2_EV5",
+    "BT_EV5",
+    "BT_3_EV5",
+    "BT_DM5",
+    "BT_2_DH5",
+    "BT_DH5",
+    "BT_3_DH5",
+}
 
 F0_HZ_DEFAULT = 2.412e9      # 默认 2412 MHz 基波
 MAX_FREQ_HZ = 18e9           # 谐波最高测到 18 GHz
@@ -169,6 +217,7 @@ def measure_cpow_20m(
     inst: FsvSocket,
     f0_hz: float,
     loss_table: Optional[List[Tuple[float, float, float]]] = None,
+    channel_bw_hz: float = 20e6,
 ) -> float:
     """
     使用 CPOW 读取主载波 20 MHz 通道功率（dBm）
@@ -205,7 +254,7 @@ def measure_cpow_20m(
     inst.send_cmd("SENS:AVER:COUN 100")
 
     # 20 MHz 通道带宽
-    inst.send_cmd("SENS:POW:ACH:BWID:CHAN1 20000000")
+    inst.send_cmd(f"SENS:POW:ACH:BWID:CHAN1 {int(channel_bw_hz)}")
 
     # CPOW 功能
     inst.send_cmd("CALC:MARK:FUNC:POW:SEL CPOW")
@@ -218,6 +267,7 @@ def measure_cpow_20m(
     cpow_str = inst.query("CALC:MARK:FUNC:POW:RES? CPOW")
     first_field = cpow_str.split(",")[0].strip()
     cpow = float(first_field)
+    print(f"[INFO] Integrated channel bandwidth: {channel_bw_hz/1e6:.0f} MHz")
 
     print(f"[RESULT] 主载波 {f0_hz/1e9:.4f} GHz, 20MHz 通道功率 = {cpow:.2f} dBm")
 
@@ -395,13 +445,22 @@ def _parse_config_cell(cell: str, out: Dict[str, object]) -> None:
     if norm == "CERTIFICATION_MODE":
         out[norm] = val.upper()
         return
+    if norm == "FIRMWARE_TYPE":
+        out[norm] = val.upper()
+        return
+    if norm == "TEST_MODE":
+        out[norm] = val.upper()
+        return
+    if norm == "PACKET_TYPE":
+        out[norm] = val.upper()
+        return
     if norm == "OFFSET":
         try:
             out[norm] = float(val)
         except ValueError:
             pass
         return
-    if norm in {"DUTY_CYCLE", "PSDU_LEN"}:
+    if norm in {"DUTY_CYCLE", "PSDU_LEN", "PAYLOAD", "PAYLOAD_LEN"}:
         try:
             out[norm] = int(float(val))
         except ValueError:
@@ -461,11 +520,14 @@ def _apply_config_header_row(header: List[str], row: List[str], out: Dict[str, o
             except ValueError:
                 pass
             continue
-        if norm in {"DUTY_CYCLE", "PSDU_LEN"}:
+        if norm in {"DUTY_CYCLE", "PSDU_LEN", "PAYLOAD", "PAYLOAD_LEN"}:
             try:
                 out[norm] = int(float(val_str))
             except ValueError:
                 pass
+            continue
+        if norm in {"FIRMWARE_TYPE", "TEST_MODE", "PACKET_TYPE"}:
+            out[norm] = val_str.upper()
             continue
         if norm in {"GPIO20", "GPIO21"}:
             out[norm] = _parse_gpio_value(val_str)
@@ -1123,8 +1185,111 @@ def _build_tx_config_cmd(config: Dict[str, object]) -> str:
         f"PSDU_LEN {config['PSDU_LEN']}"
     )
 
+
+def _is_bt_packet(packet_type: str) -> bool:
+    upper = packet_type.strip().upper()
+    return upper.startswith("BT_") and not upper.startswith("BT_BLE_")
+
+
+def _build_bt_tx_config_cmd(config: Dict[str, object]) -> str:
+    packet_type = str(config.get("PACKET_TYPE", "")).strip().upper()
+    if packet_type not in BT_PACKET_TYPES:
+        raise ValueError(f"Invalid BT PACKET_TYPE: {packet_type!r}")
+    chan = int(config.get("CHAN", 0))
+    if _is_bt_packet(packet_type):
+        if chan < 0 or chan > 78:
+            raise ValueError(f"BT channel out of range for {packet_type}: {chan}")
+    else:
+        if chan < 0 or chan > 39:
+            raise ValueError(f"BLE channel out of range for {packet_type}: {chan}")
+    payload = int(config.get("PAYLOAD", 0))
+    payload_len = int(config.get("PAYLOAD_LEN", 37))
+    if payload < 0 or payload > 7:
+        raise ValueError(f"PAYLOAD out of range: {payload}")
+    if payload_len < 0 or payload_len > 255:
+        raise ValueError(f"PAYLOAD_LEN out of range: {payload_len}")
+    return (
+        "BT_TX_CONFIG "
+        f"PACKET_TYPE {packet_type} "
+        f"CHAN {chan} "
+        f"PAYLOAD {payload} "
+        f"PAYLOAD_LEN {payload_len}"
+    )
+
+
+def _build_bt_rx_config_cmd(config: Dict[str, object]) -> str:
+    packet_type = str(config.get("PACKET_TYPE", "")).strip().upper()
+    if packet_type not in BT_PACKET_TYPES:
+        raise ValueError(f"Invalid BT PACKET_TYPE: {packet_type!r}")
+    chan = int(config.get("CHAN", 0))
+    if _is_bt_packet(packet_type):
+        if chan < 0 or chan > 78:
+            raise ValueError(f"BT channel out of range for {packet_type}: {chan}")
+    else:
+        if chan < 0 or chan > 39:
+            raise ValueError(f"BLE channel out of range for {packet_type}: {chan}")
+    return f"BT_RX_CONFIG PACKET_TYPE {packet_type} CHAN {chan}"
+
+
+def measure_cpow_with_bt_power_calibration(
+    inst: FsvSocket,
+    gui,
+    f0_hz: float,
+    tolerance_db: float = 0.5,
+    step_db: float = 0.25,
+    max_iters: int = 20,
+    control_tx: bool = True,
+    desired_target: Optional[float] = None,
+    cmd_delay: float = 0.0,
+    loss_table: Optional[List[Tuple[float, float, float]]] = None,
+    channel_bw_hz: float = 2e6,
+) -> Tuple[float, float, float]:
+    resp = gui.query("BT_POWER_GET")
+    _sleep_cmd(cmd_delay)
+    if desired_target is None:
+        desired_target = _parse_power_value(resp)
+    if desired_target is None:
+        raise ValueError("Missing desired BT power target")
+    current_target = desired_target
+    gui.send(f"BT_POWER_TARGET POWER {current_target}")
+    _sleep_cmd(cmd_delay)
+    if control_tx:
+        gui.send("BT_START_TX")
+        _sleep_cmd(cmd_delay)
+        if TX_START_STABLE_S > 0:
+            time.sleep(TX_START_STABLE_S)
+    try:
+        cpow = measure_cpow_20m(inst, f0_hz, loss_table=loss_table, channel_bw_hz=channel_bw_hz)
+        if abs(cpow - desired_target) > tolerance_db:
+            current_target = desired_target + (desired_target - cpow)
+            current_target = round(current_target / step_db) * step_db
+            gui.send(f"BT_POWER_TARGET POWER {current_target}")
+            _sleep_cmd(cmd_delay)
+            cpow = measure_cpow_20m(inst, f0_hz, loss_table=loss_table, channel_bw_hz=channel_bw_hz)
+            if abs(cpow - desired_target) > tolerance_db:
+                for _ in range(max_iters):
+                    if cpow < desired_target:
+                        current_target += step_db
+                    else:
+                        current_target -= step_db
+                    current_target = round(current_target / step_db) * step_db
+                    gui.send(f"BT_POWER_TARGET POWER {current_target}")
+                    _sleep_cmd(cmd_delay)
+                    cpow = measure_cpow_20m(
+                        inst, f0_hz, loss_table=loss_table, channel_bw_hz=channel_bw_hz
+                    )
+                    if abs(cpow - desired_target) <= tolerance_db:
+                        break
+        final_target = _parse_power_value(gui.query("BT_POWER_GET"))
+        _sleep_cmd(cmd_delay)
+        return desired_target, cpow, final_target
+    finally:
+        if control_tx:
+            gui.send("BT_STOP_TX")
+            _sleep_cmd(cmd_delay)
+
 def _extract_harmonic_columns(header: List[str]) -> List[Tuple[float, str]]:
-    known = {"CH", "FREQ", "PWR", "PWRTAR"}
+    known = {"CH", "FREQ", "PWR", "PWRTAR", "PWR_BT", "PWRTAR_BT"}
     results: List[Tuple[float, str]] = []
     for col in header:
         if not col:
@@ -1186,6 +1351,7 @@ def run_csv_test(
     cal_scope_step: Optional[float] = None,
     band_24: bool = True,
     band_5: bool = True,
+    flow_mode: str = "WIFI",
 ) -> None:
     rows_out: List[List[str]] = []
     base_defaults = dict(DEFAULT_TX_CONFIG)
@@ -1193,6 +1359,10 @@ def run_csv_test(
         base_defaults["CONNECT_TYPE"] = default_connect_type
     if default_firmware_type in FIRMWARE_TYPES:
         base_defaults["FIRMWARE_TYPE"] = default_firmware_type
+    elif flow_mode.upper() == "BT":
+        base_defaults["FIRMWARE_TYPE"] = "BLE"
+    else:
+        base_defaults["FIRMWARE_TYPE"] = "WIFI"
     defaults = dict(base_defaults)
     header: Optional[List[str]] = None
     harmonics: List[Tuple[float, str]] = []
@@ -1205,6 +1375,7 @@ def run_csv_test(
     current_cert_mode: Optional[str] = None
     current_gpio20: Optional[str] = None
     current_gpio21: Optional[str] = None
+    current_firmware_type: Optional[str] = None
     last_calibration: Dict[Tuple[float, float], Tuple[float, float]] = {}
     loss_table = cable_loss_table or []
     use_scope = (
@@ -1219,7 +1390,7 @@ def run_csv_test(
 
     def _process_row(entry: Dict[str, object], offset: float, block_base_cal: Optional[float]) -> bool:
         nonlocal current_connect_type, current_antenna, current_cert_mode
-        nonlocal current_gpio20, current_gpio21, last_calibration
+        nonlocal current_gpio20, current_gpio21, current_firmware_type, last_calibration
 
         row_map = dict(entry["row_map"])
         config = entry["config"]
@@ -1233,39 +1404,59 @@ def run_csv_test(
                 gui.send(f"CONNECT TYPE {connect_type}")
                 _sleep_cmd(CMD_DELAY)
                 current_connect_type = connect_type
+            row_fw = str(config.get("FIRMWARE_TYPE", "")).strip().upper() or "WIFI"
+            if flow_mode.upper() == "BT":
+                firmware_type = "BLE" if row_fw == "WIFI" else row_fw
+            else:
+                firmware_type = row_fw if row_fw in FIRMWARE_TYPES else "WIFI"
+            if firmware_type != current_firmware_type:
+                gui.send(f"SELECT_FIRMWARE_TYPE TYPE {firmware_type}")
+                _sleep_cmd(CMD_DELAY)
+                current_firmware_type = firmware_type
+            is_bt_path = firmware_type in {"BLE", "WIFI_AND_BLE"} and flow_mode.upper() == "BT"
+
             antenna = str(config.get("ANTENNA", "")).strip().upper()
-            if antenna:
-                if antenna not in {"ANT1", "ANT2", "ALL"}:
-                    raise ValueError(f"Invalid ANTENNA value: {antenna!r}")
-                if antenna != current_antenna:
-                    gui.send(f"ANTENNA ANT {antenna}")
-                    _sleep_cmd(CMD_DELAY)
-                    current_antenna = antenna
             cert_mode = str(config.get("CERTIFICATION_MODE", "")).strip().upper()
-            if cert_mode:
-                if cert_mode not in {"NORMAL", "CE", "FCC", "SRRC", "SRRC_2"}:
-                    raise ValueError(f"Invalid CERTIFICATION MODE value: {cert_mode!r}")
-                if cert_mode != current_cert_mode:
-                    gui.send(f"CERTIFICATION MODE {cert_mode}")
+            if not is_bt_path:
+                if antenna:
+                    if antenna not in {"ANT1", "ANT2", "ALL"}:
+                        raise ValueError(f"Invalid ANTENNA value: {antenna!r}")
+                    if antenna != current_antenna:
+                        gui.send(f"ANTENNA ANT {antenna}")
+                        _sleep_cmd(CMD_DELAY)
+                        current_antenna = antenna
+                if cert_mode:
+                    if cert_mode not in {"NORMAL", "CE", "FCC", "SRRC", "SRRC_2"}:
+                        raise ValueError(f"Invalid CERTIFICATION MODE value: {cert_mode!r}")
+                    if cert_mode != current_cert_mode:
+                        gui.send(f"CERTIFICATION MODE {cert_mode}")
+                        _sleep_cmd(CMD_DELAY)
+                        if cert_mode == "FCC":
+                            _sleep_cmd(0.5)
+                        current_cert_mode = cert_mode
+                gpio20_level = _normalize_gpio_level(config.get("GPIO20"))
+                if gpio20_level and gpio20_level != current_gpio20:
+                    gui.send(f"GPIO_OUTPUT GPIO 20 LEVEL {gpio20_level}")
                     _sleep_cmd(CMD_DELAY)
-                    if cert_mode == "FCC":
-                        _sleep_cmd(0.5)
-                    current_cert_mode = cert_mode
-            gpio20_level = _normalize_gpio_level(config.get("GPIO20"))
-            if gpio20_level and gpio20_level != current_gpio20:
-                gui.send(f"GPIO_OUTPUT GPIO 20 LEVEL {gpio20_level}")
+                    current_gpio20 = gpio20_level
+                gpio21_level = _normalize_gpio_level(config.get("GPIO21"))
+                if gpio21_level and gpio21_level != current_gpio21:
+                    gui.send(f"GPIO_OUTPUT GPIO 21 LEVEL {gpio21_level}")
+                    _sleep_cmd(CMD_DELAY)
+                    current_gpio21 = gpio21_level
+
+            if is_bt_path:
+                gui.send(_build_bt_tx_config_cmd(config))
                 _sleep_cmd(CMD_DELAY)
-                current_gpio20 = gpio20_level
-            gpio21_level = _normalize_gpio_level(config.get("GPIO21"))
-            if gpio21_level and gpio21_level != current_gpio21:
-                gui.send(f"GPIO_OUTPUT GPIO 21 LEVEL {gpio21_level}")
+                gui.send("BT_START_TX")
                 _sleep_cmd(CMD_DELAY)
-                current_gpio21 = gpio21_level
-            gui.send(_build_tx_config_cmd(config))
-            _sleep_cmd(CMD_DELAY)
-            gui.start_tx()
-            _sleep_cmd(CMD_DELAY)
-            started_tx = True
+                started_tx = True
+            else:
+                gui.send(_build_tx_config_cmd(config))
+                _sleep_cmd(CMD_DELAY)
+                gui.start_tx()
+                _sleep_cmd(CMD_DELAY)
+                started_tx = True
             if SIMPLE_GUI_FLOW:
                 print("[INFO] SIMPLE_GUI_FLOW enabled: only TX_CONFIG -> START_TX, then stop.")
                 return True
@@ -1276,7 +1467,7 @@ def run_csv_test(
                 except KeyboardInterrupt:
                     print()
                 return True
-            skip_cal = _should_skip_calibration(
+            skip_cal = False if is_bt_path else _should_skip_calibration(
                 antenna, config.get("GPIO20"), config.get("GPIO21")
             )
 
@@ -1303,8 +1494,12 @@ def run_csv_test(
             cached = last_calibration.get(cache_key)
             if skip_cal and cached:
                 cached_pwr, cached_pwr_tar = cached
-                gui.power_target(cached_pwr_tar)
-                _sleep_cmd(CMD_DELAY)
+                if is_bt_path:
+                    gui.send(f"BT_POWER_TARGET POWER {cached_pwr_tar}")
+                    _sleep_cmd(CMD_DELAY)
+                else:
+                    gui.power_target(cached_pwr_tar)
+                    _sleep_cmd(CMD_DELAY)
                 cpow = cached_pwr
                 power_tar_final = cached_pwr_tar
             else:
@@ -1313,22 +1508,37 @@ def run_csv_test(
                         f"[WARN] Skip calibration requested but no prior data for {f0_hz/1e6:.0f} MHz; "
                         "falling back to calibration."
                     )
-                power_target, cpow, power_tar_final = measure_cpow_with_power_calibration(
-                    inst,
-                    gui,
-                    f0_hz,
-                    control_tx=False,
-                    desired_target=desired_target,
-                    cmd_delay=CMD_DELAY,
-                    loss_table=loss_table,
-                )
+                if is_bt_path:
+                    power_target, cpow, power_tar_final = measure_cpow_with_bt_power_calibration(
+                        inst,
+                        gui,
+                        f0_hz,
+                        control_tx=False,
+                        desired_target=desired_target,
+                        cmd_delay=CMD_DELAY,
+                        loss_table=loss_table,
+                    )
+                else:
+                    power_target, cpow, power_tar_final = measure_cpow_with_power_calibration(
+                        inst,
+                        gui,
+                        f0_hz,
+                        control_tx=False,
+                        desired_target=desired_target,
+                        cmd_delay=CMD_DELAY,
+                        loss_table=loss_table,
+                    )
                 last_calibration[cache_key] = (cpow, power_tar_final)
         else:
             cpow = measure_cpow_20m(inst, f0_hz, loss_table=loss_table)
 
         row_map["Pwr"] = f"{cpow:.1f}"
+        if flow_mode.upper() == "BT":
+            row_map["Pwr_BT"] = f"{cpow:.1f}"
         if power_tar_final is not None:
             row_map["PwrTar"] = f"{power_tar_final:.1f}"
+            if flow_mode.upper() == "BT":
+                row_map["PwrTar_BT"] = f"{power_tar_final:.1f}"
 
         if STOP_AFTER_CALIBRATION:
             pwr_tar_text = f"{power_tar_final:.1f}" if power_tar_final is not None else "N/A"
@@ -1354,12 +1564,18 @@ def run_csv_test(
             for item in harm_results:
                 key = item.get("order_str", str(item["order"]))
                 row_map[key] = f"{item['best']['power']:.1f}"
+                if flow_mode.upper() == "BT":
+                    row_map[f"{key}_BT"] = f"{item['best']['power']:.1f}"
 
         out_row = [row_map.get(col, "") for col in header]
         rows_out.append(out_row)
         if gui and started_tx:
-            gui.stop_tx()
-            _sleep_cmd(CMD_DELAY)
+            if flow_mode.upper() == "BT":
+                gui.send("BT_STOP_TX")
+                _sleep_cmd(CMD_DELAY)
+            else:
+                gui.stop_tx()
+                _sleep_cmd(CMD_DELAY)
         return False
 
     def _process_block() -> bool:
@@ -1493,11 +1709,14 @@ def run_csv_test(
                 except ValueError:
                     pass
                 continue
-            if norm in {"DUTY_CYCLE", "PSDU_LEN"}:
+            if norm in {"DUTY_CYCLE", "PSDU_LEN", "PAYLOAD", "PAYLOAD_LEN"}:
                 try:
                     config[norm] = int(float(val))
                 except ValueError:
                     pass
+                continue
+            if norm in {"FIRMWARE_TYPE", "TEST_MODE", "PACKET_TYPE"}:
+                config[norm] = str(val).strip().upper()
                 continue
             config[norm] = val
 
@@ -1515,12 +1734,13 @@ def run_csv_test(
             rows_out.append(row)
             continue
 
-        if f0_hz < 3e9:
-            if not band_24:
-                continue
-        elif f0_hz >= 4e9:
-            if not band_5:
-                continue
+        if flow_mode.upper() != "BT":
+            if f0_hz < 3e9:
+                if not band_24:
+                    continue
+            elif f0_hz >= 4e9:
+                if not band_5:
+                    continue
 
         block_rows.append(
             {
@@ -1808,6 +2028,27 @@ def _resolve_config_resource(name: str) -> Path:
     return bundle_root / name
 
 
+def _select_profile_files(profile: str, flow_mode: str) -> Tuple[str, str, str]:
+    mode = flow_mode.strip().upper()
+    if mode == "BT":
+        input_csv_name = INPUT_CSV_BT_BLE
+        output_csv_name = OUTPUT_CSV_BT
+        loss_table_name = LOSS_TABLE_PATH
+        return input_csv_name, output_csv_name, loss_table_name
+
+    input_csv_name = INPUT_CSV_SINGLE_BAND
+    output_csv_name = OUTPUT_CSV
+    loss_table_name = LOSS_TABLE_PATH
+    if profile == "DULE_BAND":
+        input_csv_name = INPUT_CSV_DULE_BAND
+        output_csv_name = f"DULE_BAND_{OUTPUT_CSV}"
+    elif profile == "Dule_Antenna":
+        input_csv_name = INPUT_CSV_DULE_ANTENNA
+        output_csv_name = f"Dule_Antenna_{OUTPUT_CSV}"
+        loss_table_name = LOSS_TABLE_PATH_DULE_ANTENNA
+    return input_csv_name, output_csv_name, loss_table_name
+
+
 def main():
     inst = FsvSocket(FSV_IP, FSV_PORT, SOCKET_TIMEOUT)
     gui = None
@@ -1823,41 +2064,60 @@ def main():
         selected_connect_type,
         selected_firmware_type,
     ) = _prompt_user_inputs()
-    input_csv_name = INPUT_CSV_SINGLE_BAND
-    loss_table_name = LOSS_TABLE_PATH
-    output_csv_name = OUTPUT_CSV
-    if profile == "DULE_BAND":
-        input_csv_name = INPUT_CSV_DULE_BAND
-        output_csv_name = f"DULE_BAND_{OUTPUT_CSV}"
-    elif profile == "Dule_Antenna":
-        input_csv_name = INPUT_CSV_DULE_ANTENNA
-        loss_table_name = LOSS_TABLE_PATH_DULE_ANTENNA
-        output_csv_name = f"Dule_Antenna_{OUTPUT_CSV}"
-    if not _ensure_xlsx_support([input_csv_name, output_csv_name]):
+    selected_fw = (selected_firmware_type or "WIFI").strip().upper()
+    flow_plan: List[str]
+    if selected_fw == "BLE":
+        flow_plan = ["BT"]
+    elif selected_fw == "WIFI_AND_BLE":
+        flow_plan = ["WIFI", "BT"]
+    else:
+        flow_plan = ["WIFI"]
+
+    jobs: List[Dict[str, object]] = []
+    for flow_mode in flow_plan:
+        input_csv_name, output_csv_name, loss_table_name = _select_profile_files(profile, flow_mode)
+        jobs.append(
+            {
+                "flow_mode": flow_mode,
+                "input_csv_name": input_csv_name,
+                "output_csv_name": output_csv_name,
+                "loss_table_name": loss_table_name,
+            }
+        )
+
+    xlsx_paths: List[str] = []
+    for job in jobs:
+        xlsx_paths.append(str(job["input_csv_name"]))
+        xlsx_paths.append(str(job["output_csv_name"]))
+    if not _ensure_xlsx_support(xlsx_paths):
         return
-    input_path = _resolve_config_resource(input_csv_name)
-    csv_gui_host, csv_gui_port, csv_connect_type, csv_gui_exe_path = _load_global_csv_settings(
-        str(input_path)
-    )
-    effective_connect_type = selected_connect_type or csv_connect_type
+
+    for job in jobs:
+        input_path = _resolve_config_resource(str(job["input_csv_name"]))
+        if str(job["flow_mode"]).upper() == "BT" and not input_path.exists():
+            raise FileNotFoundError(
+                f"BT config file not found: {input_path}. "
+                f"Expected file name: {job['input_csv_name']}"
+            )
+        job["input_path"] = input_path
+        csv_gui_host, csv_gui_port, csv_connect_type, csv_gui_exe_path = _load_global_csv_settings(
+            str(input_path)
+        )
+        job["csv_gui_host"] = csv_gui_host
+        job["csv_gui_port"] = csv_gui_port
+        job["csv_connect_type"] = csv_connect_type
+        job["csv_gui_exe_path"] = csv_gui_exe_path
+
     base_dir = _get_base_dir()
     config_dir = _get_config_dir()
     config_dir.mkdir(parents=True, exist_ok=True)
     result_dir = _get_result_dir()
     result_dir.mkdir(parents=True, exist_ok=True)
-    output_path = str(result_dir / output_csv_name)
-    if dut_name:
-        output_path = str(result_dir / f"{dut_name}_{output_csv_name}")
-    output_path = _append_timestamp(output_path)
-    loss_path = _resolve_config_resource(loss_table_name)
-    cable_loss_table = _load_cable_loss_table(str(loss_path))
-    if cable_loss_table:
-        print(f"[INFO] Cable loss table loaded: {len(cable_loss_table)} ranges from {loss_path}")
-    else:
-        print(f"[WARN] Cable loss table is empty or missing: {loss_path}")
-    gui_host = csv_gui_host or GUI_HOST
-    gui_port = csv_gui_port or GUI_PORT
-    gui_exe_path = csv_gui_exe_path or GUI_EXE_PATH
+    first_job = jobs[0]
+    gui_host = str(first_job.get("csv_gui_host") or GUI_HOST)
+    gui_port = int(first_job.get("csv_gui_port") or GUI_PORT)
+    gui_exe_path = str(first_job.get("csv_gui_exe_path") or GUI_EXE_PATH)
+    written_results: List[Tuple[str, str]] = []
     if USE_GUI_CALIBRATION:
         GuiSocketClient = _load_gui_client_class()
         gui = GuiSocketClient(gui_host, gui_port, GUI_TIMEOUT, trailing_space=True, log_io=False)
@@ -1888,20 +2148,43 @@ def main():
         idn = inst.query("*IDN?")
         print("[IDN]", idn)
 
-        run_csv_test(
-            str(input_path),
-            output_path,
-            inst,
-            gui,
-            default_connect_type=effective_connect_type,
-            default_firmware_type=selected_firmware_type,
-            cable_loss_table=cable_loss_table,
-            cal_scope_min=cal_scope_min,
-            cal_scope_max=cal_scope_max,
-            cal_scope_step=cal_scope_step,
-            band_24=band_24,
-            band_5=band_5,
-        )
+        for job in jobs:
+            flow_mode = str(job["flow_mode"])
+            input_path = Path(job["input_path"])
+            output_csv_name = str(job["output_csv_name"])
+            output_path = str(result_dir / output_csv_name)
+            if dut_name:
+                output_path = str(result_dir / f"{dut_name}_{output_csv_name}")
+            output_path = _append_timestamp(output_path)
+
+            loss_path = _resolve_config_resource(str(job["loss_table_name"]))
+            cable_loss_table = _load_cable_loss_table(str(loss_path))
+            if cable_loss_table:
+                print(f"[INFO] Cable loss table loaded: {len(cable_loss_table)} ranges from {loss_path}")
+            else:
+                print(f"[WARN] Cable loss table is empty or missing: {loss_path}")
+
+            csv_connect_type = str(job.get("csv_connect_type") or "")
+            effective_connect_type = selected_connect_type or csv_connect_type
+            default_fw = "BLE" if flow_mode.upper() == "BT" else "WIFI"
+
+            print(f"[INFO] Starting {flow_mode} test with config: {input_path.name}")
+            run_csv_test(
+                str(input_path),
+                output_path,
+                inst,
+                gui,
+                default_connect_type=effective_connect_type,
+                default_firmware_type=default_fw,
+                cable_loss_table=cable_loss_table,
+                cal_scope_min=cal_scope_min,
+                cal_scope_max=cal_scope_max,
+                cal_scope_step=cal_scope_step,
+                band_24=band_24,
+                band_5=band_5,
+                flow_mode=flow_mode,
+            )
+            written_results.append((output_path, str(input_path)))
 
     finally:
         if gui:
@@ -1911,9 +2194,10 @@ def main():
                     version_text = str(gui_version).strip() or "(empty)"
                     print(f"[RESULT] GUI GET_VERSION: {version_text}")
                     try:
-                        rows = _read_table_rows(output_path) if os.path.exists(output_path) else []
-                        rows.append(["GET_VERSION", version_text])
-                        _write_table_rows(output_path, rows, template_path=str(input_path))
+                        for output_path, input_path in written_results:
+                            rows = _read_table_rows(output_path) if os.path.exists(output_path) else []
+                            rows.append(["GET_VERSION", version_text])
+                            _write_table_rows(output_path, rows, template_path=str(input_path))
                     except Exception as exc:
                         print(f"[WARN] Failed to write GET_VERSION to result: {exc}")
                 except Exception as exc:
