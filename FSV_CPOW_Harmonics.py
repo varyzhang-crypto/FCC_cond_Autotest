@@ -41,6 +41,8 @@ GUI_TIMEOUT = 5.0
 USE_GUI_CALIBRATION = True
 CMD_DELAY = 1.0
 TX_START_STABLE_S = 0.8
+FW_SWITCH_DISCONNECT_S = 0.8
+FW_SWITCH_SETTLE_S = 3.0
 STOP_AFTER_START_TX = False
 SIMPLE_GUI_FLOW = False
 STOP_AFTER_CALIBRATION = False
@@ -106,9 +108,12 @@ KEY_ALIASES = {
     "TEST_MODE": "TEST_MODE",
     "PACKET TYPE": "PACKET_TYPE",
     "PACKET_TYPE": "PACKET_TYPE",
+    "PACKETTYPE": "PACKET_TYPE",
+    "PCKTYPE": "PACKET_TYPE",
     "PAYLOAD": "PAYLOAD",
     "PAYLOAD LEN": "PAYLOAD_LEN",
     "PAYLOAD_LEN": "PAYLOAD_LEN",
+    "PAYLOADLEN": "PAYLOAD_LEN",
 }
 
 FIRMWARE_TYPES = {"WIFI", "BLE", "WIFI_AND_BLE"}
@@ -147,6 +152,30 @@ BT_PACKET_TYPES = {
     "BT_DH5",
     "BT_3_DH5",
 }
+
+
+def _normalize_firmware_type(value: object, default: str = "WIFI") -> str:
+    raw = str(value or "").strip().upper()
+    if not raw:
+        return default
+    if raw in {"BT", "BLE"}:
+        return "BLE"
+    if raw in {"WIFI+BT", "WIFI_AND_BT", "WIFI_AND_BLE"}:
+        return "WIFI_AND_BLE"
+    if raw == "WIFI":
+        return "WIFI"
+    return default
+
+
+def _normalize_bt_packet_type(value: object) -> str:
+    raw = str(value or "").strip().upper().replace("-", "_")
+    if not raw:
+        return ""
+    if raw.startswith("BT_"):
+        return raw
+    if raw.startswith("BLE_"):
+        return f"BT_{raw}"
+    return raw
 
 F0_HZ_DEFAULT = 2.412e9      # 默认 2412 MHz 基波
 MAX_FREQ_HZ = 18e9           # 谐波最高测到 18 GHz
@@ -446,13 +475,13 @@ def _parse_config_cell(cell: str, out: Dict[str, object]) -> None:
         out[norm] = val.upper()
         return
     if norm == "FIRMWARE_TYPE":
-        out[norm] = val.upper()
+        out[norm] = _normalize_firmware_type(val, default="WIFI")
         return
     if norm == "TEST_MODE":
         out[norm] = val.upper()
         return
     if norm == "PACKET_TYPE":
-        out[norm] = val.upper()
+        out[norm] = _normalize_bt_packet_type(val)
         return
     if norm == "OFFSET":
         try:
@@ -527,7 +556,12 @@ def _apply_config_header_row(header: List[str], row: List[str], out: Dict[str, o
                 pass
             continue
         if norm in {"FIRMWARE_TYPE", "TEST_MODE", "PACKET_TYPE"}:
-            out[norm] = val_str.upper()
+            if norm == "FIRMWARE_TYPE":
+                out[norm] = _normalize_firmware_type(val_str, default="WIFI")
+            elif norm == "PACKET_TYPE":
+                out[norm] = _normalize_bt_packet_type(val_str)
+            else:
+                out[norm] = val_str.upper()
             continue
         if norm in {"GPIO20", "GPIO21"}:
             out[norm] = _parse_gpio_value(val_str)
@@ -1192,7 +1226,7 @@ def _is_bt_packet(packet_type: str) -> bool:
 
 
 def _build_bt_tx_config_cmd(config: Dict[str, object]) -> str:
-    packet_type = str(config.get("PACKET_TYPE", "")).strip().upper()
+    packet_type = _normalize_bt_packet_type(config.get("PACKET_TYPE", ""))
     if packet_type not in BT_PACKET_TYPES:
         raise ValueError(f"Invalid BT PACKET_TYPE: {packet_type!r}")
     chan = int(config.get("CHAN", 0))
@@ -1218,7 +1252,7 @@ def _build_bt_tx_config_cmd(config: Dict[str, object]) -> str:
 
 
 def _build_bt_rx_config_cmd(config: Dict[str, object]) -> str:
-    packet_type = str(config.get("PACKET_TYPE", "")).strip().upper()
+    packet_type = _normalize_bt_packet_type(config.get("PACKET_TYPE", ""))
     if packet_type not in BT_PACKET_TYPES:
         raise ValueError(f"Invalid BT PACKET_TYPE: {packet_type!r}")
     chan = int(config.get("CHAN", 0))
@@ -1399,21 +1433,27 @@ def run_csv_test(
         desired_target = None
         power_tar_final = None
         if gui:
+            if (default_firmware_type or "").strip().upper() == "WIFI_AND_BLE":
+                default_fw = "WIFI_AND_BLE"
+            else:
+                default_fw = "BLE" if flow_mode.upper() == "BT" else "WIFI"
+            row_fw = _normalize_firmware_type(config.get("FIRMWARE_TYPE", ""), default=default_fw)
+            if flow_mode.upper() == "BT":
+                firmware_type = "WIFI_AND_BLE" if row_fw == "WIFI_AND_BLE" else "BLE"
+            else:
+                firmware_type = row_fw
+            if firmware_type != current_firmware_type:
+                # Some GUI builds auto-reconnect after DISCONNECT, so switch first.
+                gui.send(f"SELECT_FIRMWARE_TYPE TYPE {firmware_type}")
+                _sleep_cmd(FW_SWITCH_SETTLE_S)
+                current_firmware_type = firmware_type
+                current_connect_type = None
             connect_type = _normalize_connect_type(str(config.get("CONNECT_TYPE", "")))
             if connect_type and connect_type != current_connect_type:
                 gui.send(f"CONNECT TYPE {connect_type}")
                 _sleep_cmd(CMD_DELAY)
                 current_connect_type = connect_type
-            row_fw = str(config.get("FIRMWARE_TYPE", "")).strip().upper() or "WIFI"
-            if flow_mode.upper() == "BT":
-                firmware_type = "BLE" if row_fw == "WIFI" else row_fw
-            else:
-                firmware_type = row_fw if row_fw in FIRMWARE_TYPES else "WIFI"
-            if firmware_type != current_firmware_type:
-                gui.send(f"SELECT_FIRMWARE_TYPE TYPE {firmware_type}")
-                _sleep_cmd(CMD_DELAY)
-                current_firmware_type = firmware_type
-            is_bt_path = firmware_type in {"BLE", "WIFI_AND_BLE"} and flow_mode.upper() == "BT"
+            is_bt_path = flow_mode.upper() == "BT"
 
             antenna = str(config.get("ANTENNA", "")).strip().upper()
             cert_mode = str(config.get("CERTIFICATION_MODE", "")).strip().upper()
@@ -1716,7 +1756,12 @@ def run_csv_test(
                     pass
                 continue
             if norm in {"FIRMWARE_TYPE", "TEST_MODE", "PACKET_TYPE"}:
-                config[norm] = str(val).strip().upper()
+                if norm == "FIRMWARE_TYPE":
+                    config[norm] = _normalize_firmware_type(val, default="WIFI")
+                elif norm == "PACKET_TYPE":
+                    config[norm] = _normalize_bt_packet_type(val)
+                else:
+                    config[norm] = str(val).strip().upper()
                 continue
             config[norm] = val
 
@@ -2065,6 +2110,7 @@ def main():
         selected_firmware_type,
     ) = _prompt_user_inputs()
     selected_fw = (selected_firmware_type or "WIFI").strip().upper()
+    enable_gui_log = selected_fw in {"BLE", "WIFI_AND_BLE"}
     flow_plan: List[str]
     if selected_fw == "BLE":
         flow_plan = ["BT"]
@@ -2120,7 +2166,15 @@ def main():
     written_results: List[Tuple[str, str]] = []
     if USE_GUI_CALIBRATION:
         GuiSocketClient = _load_gui_client_class()
-        gui = GuiSocketClient(gui_host, gui_port, GUI_TIMEOUT, trailing_space=True, log_io=False)
+        gui = GuiSocketClient(
+            gui_host,
+            gui_port,
+            GUI_TIMEOUT,
+            trailing_space=False,
+            log_io=enable_gui_log,
+        )
+        if enable_gui_log:
+            print("[INFO] GUI debug I/O logging enabled for BT flow.")
 
     try:
         if AUTO_LAUNCH_GUI and gui_exe_path:
@@ -2148,7 +2202,7 @@ def main():
         idn = inst.query("*IDN?")
         print("[IDN]", idn)
 
-        for job in jobs:
+        for idx, job in enumerate(jobs):
             flow_mode = str(job["flow_mode"])
             input_path = Path(job["input_path"])
             output_csv_name = str(job["output_csv_name"])
@@ -2185,6 +2239,14 @@ def main():
                 flow_mode=flow_mode,
             )
             written_results.append((output_path, str(input_path)))
+            has_next_job = idx < (len(jobs) - 1)
+            if has_next_job and gui:
+                try:
+                    print("[INFO] Intermediate GUI disconnect before next flow.")
+                    gui.send("DISCONNECT")
+                    _sleep_cmd(FW_SWITCH_DISCONNECT_S)
+                except Exception as exc:
+                    print(f"[WARN] Intermediate DISCONNECT failed: {exc}")
 
     finally:
         if gui:
