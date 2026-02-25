@@ -1413,6 +1413,8 @@ def run_csv_test(
     last_calibration: Dict[Tuple[float, float], Tuple[float, float]] = {}
     loss_table = cable_loss_table or []
     use_scope = (
+        flow_mode.upper() != "BT"
+        and
         cal_scope_min is not None
         and cal_scope_max is not None
         and cal_scope_step is not None
