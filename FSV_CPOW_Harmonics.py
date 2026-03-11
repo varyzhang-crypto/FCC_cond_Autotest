@@ -27,6 +27,7 @@ import csv
 import os
 import sys
 from fractions import Fraction
+from wifi_bandedge import WIFI_BANDEDGE_COLUMNS, measure_wifi_bandedges, measure_bandedge_side_max
 
 
 FSV_IP = "192.168.20.151"
@@ -53,12 +54,16 @@ INPUT_CSV_SINGLE_BAND = "FCC_test_item_single_band.xlsx"
 INPUT_CSV_DULE_BAND = "FCC_test_item_dule_band.xlsx"
 INPUT_CSV_DULE_ANTENNA = "FCC_test_item_Dule_Antenna.xlsx"
 INPUT_CSV_BT_BLE = "FCC_test_item_BT_BLE.xlsx"
+INPUT_CSV_BANDEDGE = "FCC_test_item_Bandedge.xlsx"
 OUTPUT_CSV = "FCC_conduction_result.xlsx"
 OUTPUT_CSV_BT = "BT_FCC_conduction_result.xlsx"
+OUTPUT_CSV_BANDEDGE = "Bandedge_FCC_conduction_result.xlsx"
 LOSS_TABLE_PATH = "loss.txt"
 LOSS_TABLE_PATH_DULE_ANTENNA = "loss_Dule_Antenna.txt"
 CONFIG_DIR_NAME = "config"
 RESULT_DIR_NAME = "result"
+RESULT_DIR_BANDEDGE_NAME = "result_bandedge"
+RESULT_DIR_BT_NAME = "result_bt"
 
 DEFAULT_TX_CONFIG: Dict[str, object] = {
     "CHAN": 1,
@@ -340,6 +345,7 @@ def measure_cpow_with_power_calibration(
     desired_target: Optional[float] = None,
     cmd_delay: float = 0.0,
     loss_table: Optional[List[Tuple[float, float, float]]] = None,
+    channel_bw_hz: float = 20e6,
 ) -> Tuple[float, float, float]:
     """
     Sequence: POWER_GET -> START_TX -> CPOW measure -> optional calibration -> STOP_TX.
@@ -360,14 +366,14 @@ def measure_cpow_with_power_calibration(
         if TX_START_STABLE_S > 0:
             time.sleep(TX_START_STABLE_S)
     try:
-        cpow = measure_cpow_20m(inst, f0_hz, loss_table=loss_table)
+        cpow = measure_cpow_20m(inst, f0_hz, loss_table=loss_table, channel_bw_hz=channel_bw_hz)
         if abs(cpow - desired_target) > tolerance_db:
             # First jump: adjust by full delta, then fine-tune with 0.25 dB steps.
             current_target = desired_target + (desired_target - cpow)
             current_target = round(current_target / step_db) * step_db
             gui.power_target(current_target)
             _sleep_cmd(cmd_delay)
-            cpow = measure_cpow_20m(inst, f0_hz, loss_table=loss_table)
+            cpow = measure_cpow_20m(inst, f0_hz, loss_table=loss_table, channel_bw_hz=channel_bw_hz)
             if abs(cpow - desired_target) > tolerance_db:
                 for _ in range(max_iters):
                     if cpow < desired_target:
@@ -377,7 +383,7 @@ def measure_cpow_with_power_calibration(
                     current_target = round(current_target / step_db) * step_db
                     gui.power_target(current_target)
                     _sleep_cmd(cmd_delay)
-                    cpow = measure_cpow_20m(inst, f0_hz, loss_table=loss_table)
+                    cpow = measure_cpow_20m(inst, f0_hz, loss_table=loss_table, channel_bw_hz=channel_bw_hz)
                     if abs(cpow - desired_target) <= tolerance_db:
                         break
         final_target = _parse_power_value(gui.power_get())
@@ -403,6 +409,31 @@ def _parse_chan(value: str) -> Optional[int]:
         return int(float(raw))
     except ValueError:
         return None
+
+
+def _parse_wifi_channel_bw_hz(value: object, default_hz: float = 20e6) -> float:
+    raw = str(value or "").strip().upper()
+    if not raw:
+        return default_hz
+    cleaned = raw.replace("MHZ", "M").replace(" ", "")
+    if cleaned.endswith("M"):
+        num = cleaned[:-1]
+        try:
+            bw_mhz = float(num)
+            if bw_mhz > 0:
+                return bw_mhz * 1e6
+        except Exception:
+            return default_hz
+        return default_hz
+    try:
+        numeric = float(cleaned)
+        if numeric > 1e6:
+            return numeric
+        if numeric > 0:
+            return numeric * 1e6
+    except Exception:
+        return default_hz
+    return default_hz
 
 def _parse_gpio_value(value: str) -> Optional[int]:
     raw = value.strip().upper()
@@ -651,6 +682,8 @@ def _prompt_user_inputs() -> Tuple[
     Optional[float],
     bool,
     bool,
+    bool,
+    bool,
     str,
     str,
 ]:
@@ -677,25 +710,35 @@ def _prompt_user_inputs() -> Tuple[
 
         tk.Label(dialog, text="Firmware type:").grid(row=3, column=0, sticky="w", padx=12, pady=(4, 4))
         firmware_type_var = tk.StringVar(value="WIFI")
-        tk.Radiobutton(dialog, text="WIFI", variable=firmware_type_var, value="WIFI").grid(
+        firmware_wifi_rb = tk.Radiobutton(dialog, text="WIFI", variable=firmware_type_var, value="WIFI")
+        firmware_wifi_rb.grid(
             row=3, column=1, sticky="w", padx=12
         )
-        tk.Radiobutton(dialog, text="BT", variable=firmware_type_var, value="BLE").grid(
+        firmware_bt_rb = tk.Radiobutton(dialog, text="BT", variable=firmware_type_var, value="BLE")
+        firmware_bt_rb.grid(
             row=3, column=2, sticky="w", padx=12
         )
-        tk.Radiobutton(dialog, text="WIFI+BT", variable=firmware_type_var, value="WIFI_AND_BLE").grid(
+        firmware_both_rb = tk.Radiobutton(
+            dialog, text="WIFI+BT", variable=firmware_type_var, value="WIFI_AND_BLE"
+        )
+        firmware_both_rb.grid(
             row=3, column=3, sticky="w", padx=12
         )
 
         tk.Label(dialog, text="Profile:").grid(row=4, column=0, sticky="w", padx=12, pady=(4, 4))
         profile_var = tk.StringVar(value="SINGLE_BAND")
-        tk.Radiobutton(dialog, text="SINGLE_BAND", variable=profile_var, value="SINGLE_BAND").grid(
+        profile_single_rb = tk.Radiobutton(dialog, text="SINGLE_BAND", variable=profile_var, value="SINGLE_BAND")
+        profile_single_rb.grid(
             row=5, column=0, sticky="w", padx=12
         )
-        tk.Radiobutton(dialog, text="DULE_BAND", variable=profile_var, value="DULE_BAND").grid(
+        profile_dule_band_rb = tk.Radiobutton(dialog, text="DULE_BAND", variable=profile_var, value="DULE_BAND")
+        profile_dule_band_rb.grid(
             row=5, column=1, sticky="w", padx=12
         )
-        tk.Radiobutton(dialog, text="Dule_Antenna", variable=profile_var, value="Dule_Antenna").grid(
+        profile_dule_ant_rb = tk.Radiobutton(
+            dialog, text="Dule_Antenna", variable=profile_var, value="Dule_Antenna"
+        )
+        profile_dule_ant_rb.grid(
             row=5, column=2, sticky="w", padx=12
         )
 
@@ -707,25 +750,38 @@ def _prompt_user_inputs() -> Tuple[
         band_5_cb = tk.Checkbutton(dialog, text="5G", variable=band_5_var)
         band_5_cb.grid(row=6, column=2, sticky="w", padx=6)
 
-        enable_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(dialog, text="Cal Power Scope", variable=enable_var).grid(
-            row=7, column=0, columnspan=4, sticky="w", padx=12, pady=(8, 4)
+        tk.Label(dialog, text="Test:").grid(row=7, column=0, sticky="w", padx=12, pady=(6, 4))
+        harmonic_test_var = tk.BooleanVar(value=True)
+        bandedge_test_var = tk.BooleanVar(value=True)
+        harmonic_test_cb = tk.Checkbutton(dialog, text="Harmonic", variable=harmonic_test_var)
+        harmonic_test_cb.grid(
+            row=7, column=1, sticky="w", padx=6
+        )
+        bandedge_test_cb = tk.Checkbutton(dialog, text="Bandedge", variable=bandedge_test_var)
+        bandedge_test_cb.grid(
+            row=7, column=2, sticky="w", padx=6
         )
 
-        tk.Label(dialog, text="Min").grid(row=8, column=0, sticky="w", padx=12)
+        enable_var = tk.BooleanVar(value=False)
+        cal_scope_cb = tk.Checkbutton(dialog, text="Cal Power Scope", variable=enable_var)
+        cal_scope_cb.grid(
+            row=8, column=0, columnspan=4, sticky="w", padx=12, pady=(8, 4)
+        )
+
+        tk.Label(dialog, text="Min").grid(row=9, column=0, sticky="w", padx=12)
         min_var = tk.StringVar(value="-1")
         min_entry = tk.Entry(dialog, textvariable=min_var, width=8)
-        min_entry.grid(row=8, column=1, padx=6, pady=4)
+        min_entry.grid(row=9, column=1, padx=6, pady=4)
 
-        tk.Label(dialog, text="Max").grid(row=8, column=2, sticky="w", padx=6)
+        tk.Label(dialog, text="Max").grid(row=9, column=2, sticky="w", padx=6)
         max_var = tk.StringVar(value="0")
         max_entry = tk.Entry(dialog, textvariable=max_var, width=8)
-        max_entry.grid(row=8, column=3, padx=6, pady=4)
+        max_entry.grid(row=9, column=3, padx=6, pady=4)
 
-        tk.Label(dialog, text="Step").grid(row=9, column=0, sticky="w", padx=12)
+        tk.Label(dialog, text="Step").grid(row=10, column=0, sticky="w", padx=12)
         step_var = tk.StringVar(value="1")
         step_entry = tk.Entry(dialog, textvariable=step_var, width=8)
-        step_entry.grid(row=9, column=1, padx=6, pady=4)
+        step_entry.grid(row=10, column=1, padx=6, pady=4)
 
         tip_text = (
             "SWITCH connection:\n"
@@ -734,29 +790,61 @@ def _prompt_user_inputs() -> Tuple[
             "SMA3->ANT2, SMA4->50ohm"
         )
         tk.Label(dialog, text=tip_text, justify="left").grid(
-            row=10, column=0, columnspan=4, sticky="w", padx=12, pady=(6, 4)
+            row=11, column=0, columnspan=4, sticky="w", padx=12, pady=(6, 4)
         )
 
-        def _set_state(enabled: bool) -> None:
+        def _set_scope_state(enabled: bool) -> None:
             state = "normal" if enabled else "disabled"
             min_entry.configure(state=state)
             max_entry.configure(state=state)
             step_entry.configure(state=state)
 
-        def _set_band_state() -> None:
-            if profile_var.get() == "SINGLE_BAND":
+        def _refresh_ui_state() -> None:
+            fw = firmware_type_var.get().strip().upper()
+            wifi_path_enabled = fw in {"WIFI", "WIFI_AND_BLE"}
+            normal_or_disabled = "normal" if wifi_path_enabled else "disabled"
+
+            profile_single_rb.configure(state=normal_or_disabled)
+            profile_dule_band_rb.configure(state=normal_or_disabled)
+            profile_dule_ant_rb.configure(state=normal_or_disabled)
+            harmonic_test_cb.configure(state=normal_or_disabled)
+            bandedge_test_cb.configure(state=normal_or_disabled)
+            cal_scope_cb.configure(state=normal_or_disabled)
+
+            if not wifi_path_enabled:
                 band_24_var.set(True)
                 band_5_var.set(True)
+                harmonic_test_var.set(False)
+                bandedge_test_var.set(False)
+                if enable_var.get():
+                    enable_var.set(False)
+                band_24_cb.configure(state="disabled")
+                band_5_cb.configure(state="disabled")
+                _set_scope_state(False)
+                return
+
+            if profile_var.get() == "SINGLE_BAND":
+                band_24_var.set(True)
+                band_5_var.set(False)
                 band_24_cb.configure(state="disabled")
                 band_5_cb.configure(state="disabled")
             else:
                 band_24_cb.configure(state="normal")
                 band_5_cb.configure(state="normal")
 
-        _set_state(False)
-        enable_var.trace_add("write", lambda *_: _set_state(enable_var.get()))
-        profile_var.trace_add("write", lambda *_: _set_band_state())
-        _set_band_state()
+            scope_enabled = bool(harmonic_test_var.get())
+            if not scope_enabled and enable_var.get():
+                enable_var.set(False)
+            cal_scope_cb.configure(state="normal" if scope_enabled else "disabled")
+            _set_scope_state(scope_enabled and bool(enable_var.get()))
+
+        _set_scope_state(False)
+        enable_var.trace_add("write", lambda *_: _refresh_ui_state())
+        profile_var.trace_add("write", lambda *_: _refresh_ui_state())
+        firmware_type_var.trace_add("write", lambda *_: _refresh_ui_state())
+        harmonic_test_var.trace_add("write", lambda *_: _refresh_ui_state())
+        bandedge_test_var.trace_add("write", lambda *_: _refresh_ui_state())
+        _refresh_ui_state()
 
         result = {"value": None}
 
@@ -788,6 +876,8 @@ def _prompt_user_inputs() -> Tuple[
                 scope_step,
                 bool(band_24_var.get()),
                 bool(band_5_var.get()),
+                bool(harmonic_test_var.get()),
+                bool(bandedge_test_var.get()),
                 connect_type_var.get().strip().upper(),
                 firmware_type_var.get().strip().upper(),
             )
@@ -798,7 +888,7 @@ def _prompt_user_inputs() -> Tuple[
             dialog.destroy()
 
         btn_frame = tk.Frame(dialog)
-        btn_frame.grid(row=11, column=0, columnspan=4, pady=12)
+        btn_frame.grid(row=12, column=0, columnspan=4, pady=12)
         tk.Button(btn_frame, text="OK", width=8, command=on_ok).pack(side="left", padx=6)
         tk.Button(btn_frame, text="Cancel", width=8, command=on_cancel).pack(side="left", padx=6)
 
@@ -837,33 +927,64 @@ def _prompt_user_inputs() -> Tuple[
                 firmware_type = "WIFI"
         except Exception:
             firmware_type = "WIFI"
-        try:
-            raw = input("Select test profile (single_band/dule_band/dule_antenna): ").strip().lower()
-            if raw in {"dule_antenna", "duleantenna"}:
-                profile = "Dule_Antenna"
-            elif raw in {"dule_band", "duleband"}:
-                profile = "DULE_BAND"
-            else:
+        wifi_path_enabled = firmware_type in {"WIFI", "WIFI_AND_BLE"}
+        profile = "SINGLE_BAND"
+        band_24 = True
+        band_5 = True
+        test_harmonic = False
+        test_bandedge = False
+        enable = False
+        if wifi_path_enabled:
+            try:
+                raw = input("Select test profile (single_band/dule_band/dule_antenna): ").strip().lower()
+                if raw in {"dule_antenna", "duleantenna"}:
+                    profile = "Dule_Antenna"
+                elif raw in {"dule_band", "duleband"}:
+                    profile = "DULE_BAND"
+                else:
+                    profile = "SINGLE_BAND"
+            except Exception:
                 profile = "SINGLE_BAND"
-        except Exception:
-            profile = "SINGLE_BAND"
-        try:
-            if profile == "SINGLE_BAND":
+            try:
+                if profile == "SINGLE_BAND":
+                    band_24 = True
+                    band_5 = False
+                else:
+                    band_24 = input("Enable 2.4G? (y/n): ").strip().lower() in {"y", "yes"}
+                    band_5 = input("Enable 5G? (y/n): ").strip().lower() in {"y", "yes"}
+            except Exception:
                 band_24 = True
                 band_5 = True
-            else:
-                band_24 = input("Enable 2.4G? (y/n): ").strip().lower() in {"y", "yes"}
-                band_5 = input("Enable 5G? (y/n): ").strip().lower() in {"y", "yes"}
-        except Exception:
-            band_24 = True
-            band_5 = True
-        try:
-            enable_text = input("Enable Cal Power Scope? (y/n): ").strip().lower()
-            enable = enable_text in {"y", "yes"}
-        except Exception:
-            enable = False
+            try:
+                harmonic_test = input("Enable Harmonic test? (y/n) [y]: ").strip().lower()
+                test_harmonic = harmonic_test not in {"n", "no"}
+            except Exception:
+                test_harmonic = True
+            try:
+                bandedge_test = input("Enable Bandedge test? (y/n) [y]: ").strip().lower()
+                test_bandedge = bandedge_test not in {"n", "no"}
+            except Exception:
+                test_bandedge = True
+            if test_harmonic:
+                try:
+                    enable_text = input("Enable Cal Power Scope? (y/n): ").strip().lower()
+                    enable = enable_text in {"y", "yes"}
+                except Exception:
+                    enable = False
         if not enable:
-            return name, profile, None, None, None, band_24, band_5, connect_type, firmware_type
+            return (
+                name,
+                profile,
+                None,
+                None,
+                None,
+                band_24,
+                band_5,
+                test_harmonic,
+                test_bandedge,
+                connect_type,
+                firmware_type,
+            )
         try:
             scope_text = input("Cal Power Scope (min max, e.g. -1 0): ").strip()
             parts = scope_text.replace(",", " ").split()
@@ -877,7 +998,19 @@ def _prompt_user_inputs() -> Tuple[
             scope_step = float(step_text) if step_text else None
         except Exception:
             scope_step = None
-        return name, profile, scope_min, scope_max, scope_step, band_24, band_5, connect_type, firmware_type
+        return (
+            name,
+            profile,
+            scope_min,
+            scope_max,
+            scope_step,
+            band_24,
+            band_5,
+            test_harmonic,
+            test_bandedge,
+            connect_type,
+            firmware_type,
+        )
 def _prompt_cal_power_scope() -> Tuple[Optional[float], Optional[float], Optional[float]]:
     try:
         root = tk.Tk()
@@ -1372,6 +1505,444 @@ def _build_cal_power_offsets(
         return [0.0]
     return offsets
 
+
+BANDEDGE_LIMIT_DBM = -46.0
+
+
+def _extract_bandedge_columns(header: List[str]) -> List[Tuple[str, float]]:
+    cols: List[Tuple[str, float]] = []
+    for col in header:
+        key = str(col or "").strip()
+        if not key:
+            continue
+        upper = key.upper()
+        if upper in {"CH", "FREQ", "PWR", "PWRTAR"}:
+            continue
+        if _normalize_key(key):
+            continue
+        try:
+            freq_mhz = float(key)
+        except Exception:
+            continue
+        if 1000.0 <= freq_mhz <= 7000.0:
+            cols.append((key, freq_mhz * 1e6))
+    return cols
+
+
+def _pick_nearest_bandedge(f0_hz: float, edges: List[Tuple[str, float]]) -> Optional[Tuple[str, float, str]]:
+    if not edges:
+        return None
+    best_label = ""
+    best_edge_hz = 0.0
+    best_dist = float("inf")
+    for label, edge_hz in edges:
+        dist = abs(edge_hz - f0_hz)
+        if dist < best_dist:
+            best_label, best_edge_hz, best_dist = label, edge_hz, dist
+    if best_edge_hz <= 0:
+        return None
+    side = "LEFT" if best_edge_hz < f0_hz else "RIGHT"
+    return best_label, best_edge_hz, side
+
+
+def _tune_bandedge_max_power_target(
+    inst: FsvSocket,
+    gui,
+    f0_hz: float,
+    edge_hz: float,
+    side: str,
+    channel_bw_hz: float,
+    loss_table: Optional[List[Tuple[float, float, float]]] = None,
+    limit_dbm: float = BANDEDGE_LIMIT_DBM,
+    step_db: float = 0.25,
+    max_iters: int = 80,
+) -> Tuple[float, float, float, float]:
+    current_target = round(_parse_power_value(gui.power_get()) / step_db) * step_db
+    _sleep_cmd(CMD_DELAY)
+    # Stage 1 (coarse): assume 1 dB target change ~= 2 dB bandedge change.
+    # Use 1 dB coarse steps until the edge power is within +/-2 dB around limit.
+    coarse_target = current_target
+    coarse_edge = None
+    coarse_max_iters = min(max_iters, 20)
+    for _ in range(coarse_max_iters):
+        gui.power_target(coarse_target)
+        _sleep_cmd(CMD_DELAY)
+        edge_res = measure_bandedge_side_max(
+            inst,
+            _ensure_fsv_initialized,
+            edge_hz=edge_hz,
+            side="LEFT" if side.upper() == "LEFT" else "RIGHT",
+            loss_table=loss_table,
+        )
+        coarse_edge = float(edge_res["power_dbm"])
+        if abs(coarse_edge - limit_dbm) <= 2.0:
+            break
+        predicted = (limit_dbm - coarse_edge) / 2.0
+        if predicted > 0:
+            delta_db = max(1.0, round(predicted))
+        else:
+            delta_db = min(-1.0, round(predicted))
+        coarse_target = coarse_target + float(delta_db)
+
+    # Stage 2 (fine): 0.25 dB walk to find maximum passing target.
+    current_target = round(coarse_target / step_db) * step_db
+    best_target = None
+    best_edge = None
+    last_edge = coarse_edge
+    last_target = current_target
+    fine_max_iters = max(1, max_iters - coarse_max_iters)
+    for _ in range(fine_max_iters):
+        gui.power_target(current_target)
+        _sleep_cmd(CMD_DELAY)
+        edge_res = measure_bandedge_side_max(
+            inst,
+            _ensure_fsv_initialized,
+            edge_hz=edge_hz,
+            side="LEFT" if side.upper() == "LEFT" else "RIGHT",
+            loss_table=loss_table,
+        )
+        edge_dbm = float(edge_res["power_dbm"])
+        last_target = current_target
+        last_edge = edge_dbm
+        if edge_dbm <= limit_dbm:
+            best_target = current_target
+            best_edge = edge_dbm
+            current_target = round((current_target + step_db) / step_db) * step_db
+            continue
+        if best_target is None:
+            current_target = round((current_target - step_db) / step_db) * step_db
+            continue
+        break
+    if best_target is None:
+        final_target = float(last_target)
+        final_edge = float(last_edge or 0.0)
+    else:
+        final_target = float(best_target)
+        final_edge = float(best_edge or 0.0)
+    gui.power_target(final_target)
+    _sleep_cmd(CMD_DELAY)
+    # Bandedge flow: solve target by edge limit first, then measure in-band power once.
+    final_edge_res = measure_bandedge_side_max(
+        inst,
+        _ensure_fsv_initialized,
+        edge_hz=edge_hz,
+        side="LEFT" if side.upper() == "LEFT" else "RIGHT",
+        loss_table=loss_table,
+    )
+    final_edge_dbm = float(final_edge_res["power_dbm"])
+    final_edge_freq_hz = float(final_edge_res["freq_hz"])
+    # Enforce "closest value below or equal to limit": if measured edge is above limit,
+    # back off target by 0.25 dB and re-check until pass or iteration cap.
+    if final_edge_dbm > limit_dbm:
+        backoff_iters = 40
+        for _ in range(backoff_iters):
+            final_target = round((final_target - step_db) / step_db) * step_db
+            gui.power_target(final_target)
+            _sleep_cmd(CMD_DELAY)
+            chk = measure_bandedge_side_max(
+                inst,
+                _ensure_fsv_initialized,
+                edge_hz=edge_hz,
+                side="LEFT" if side.upper() == "LEFT" else "RIGHT",
+                loss_table=loss_table,
+            )
+            final_edge_dbm = float(chk["power_dbm"])
+            final_edge_freq_hz = float(chk["freq_hz"])
+            if final_edge_dbm <= limit_dbm:
+                break
+    final_cpow = measure_cpow_20m(inst, f0_hz, loss_table=loss_table, channel_bw_hz=channel_bw_hz)
+    return (
+        float(final_cpow),
+        final_target,
+        final_edge_dbm,
+        final_edge_freq_hz,
+    )
+
+
+def run_bandedge_test(
+    input_path: str,
+    output_path: str,
+    inst: FsvSocket,
+    gui,
+    default_connect_type: Optional[str] = None,
+    default_firmware_type: Optional[str] = None,
+    cable_loss_table: Optional[List[Tuple[float, float, float]]] = None,
+    band_24: bool = True,
+    band_5: bool = True,
+    profile: str = "SINGLE_BAND",
+    flow_mode: str = "WIFI",
+) -> None:
+    rows_out: List[List[str]] = []
+    base_defaults = dict(DEFAULT_TX_CONFIG)
+    if default_connect_type:
+        base_defaults["CONNECT_TYPE"] = default_connect_type
+    base_defaults["FIRMWARE_TYPE"] = "WIFI" if flow_mode.upper() != "BT" else "BLE"
+    if default_firmware_type in FIRMWARE_TYPES:
+        base_defaults["FIRMWARE_TYPE"] = default_firmware_type
+    defaults = dict(base_defaults)
+
+    header: Optional[List[str]] = None
+    bandedge_cols: List[Tuple[str, float]] = []
+    pending_config_header: Optional[List[str]] = None
+    pending_config_header_row: Optional[List[str]] = None
+    pending_config_value_row: Optional[List[str]] = None
+    pending_header_row: Optional[List[str]] = None
+    current_connect_type: Optional[str] = None
+    current_antenna: Optional[str] = None
+    current_cert_mode: Optional[str] = None
+    current_gpio20: Optional[str] = None
+    current_gpio21: Optional[str] = None
+    current_firmware_type: Optional[str] = None
+    loss_table = cable_loss_table or []
+    profile_key = (profile or "SINGLE_BAND").strip().upper()
+
+    def _flush_pending_block_headers() -> None:
+        nonlocal pending_config_header_row, pending_config_value_row, pending_header_row
+        if pending_config_header_row:
+            rows_out.append(pending_config_header_row)
+            pending_config_header_row = None
+        if pending_config_value_row:
+            rows_out.append(pending_config_value_row)
+            pending_config_value_row = None
+        if pending_header_row:
+            rows_out.append(pending_header_row)
+            pending_header_row = None
+
+    def _process_row(row_map: Dict[str, str], config: Dict[str, object], f0_hz: float) -> None:
+        nonlocal current_connect_type, current_antenna, current_cert_mode
+        nonlocal current_gpio20, current_gpio21, current_firmware_type
+        if not header:
+            return
+        chosen = _pick_nearest_bandedge(f0_hz, bandedge_cols)
+        channel_bw_hz = _parse_wifi_channel_bw_hz(config.get("BW"), default_hz=20e6)
+        if chosen is None:
+            _flush_pending_block_headers()
+            rows_out.append([row_map.get(col, "") for col in header])
+            return
+        edge_label, edge_hz, side = chosen
+        cpow = 0.0
+        pwr_tar = None
+        edge_dbm = None
+        marker_freq_hz = None
+        started_tx = False
+        if gui:
+            firmware_type = _normalize_firmware_type(config.get("FIRMWARE_TYPE", ""), default="WIFI")
+            if firmware_type != current_firmware_type:
+                gui.send(f"SELECT_FIRMWARE_TYPE TYPE {firmware_type}")
+                _sleep_cmd(FW_SWITCH_SETTLE_S)
+                current_firmware_type = firmware_type
+                current_connect_type = None
+            connect_type = _normalize_connect_type(str(config.get("CONNECT_TYPE", "")))
+            if connect_type and connect_type != current_connect_type:
+                gui.send(f"CONNECT TYPE {connect_type}")
+                _sleep_cmd(CMD_DELAY)
+                current_connect_type = connect_type
+            antenna = str(config.get("ANTENNA", "")).strip().upper()
+            cert_mode = str(config.get("CERTIFICATION_MODE", "")).strip().upper()
+            if antenna and antenna != current_antenna:
+                gui.send(f"ANTENNA ANT {antenna}")
+                _sleep_cmd(CMD_DELAY)
+                current_antenna = antenna
+            if cert_mode and cert_mode != current_cert_mode:
+                gui.send(f"CERTIFICATION MODE {cert_mode}")
+                _sleep_cmd(CMD_DELAY)
+                current_cert_mode = cert_mode
+            if profile_key == "DULE_ANTENNA" and antenna in {"ANT1", "ANT2"}:
+                gpio20_level = "HIGH" if antenna == "ANT1" else "LOW"
+                gpio21_level = "LOW" if antenna == "ANT1" else "HIGH"
+            else:
+                gpio20_level = _normalize_gpio_level(config.get("GPIO20"))
+                gpio21_level = _normalize_gpio_level(config.get("GPIO21"))
+            if gpio20_level and gpio20_level != current_gpio20:
+                gui.send(f"GPIO_OUTPUT GPIO 20 LEVEL {gpio20_level}")
+                _sleep_cmd(CMD_DELAY)
+                current_gpio20 = gpio20_level
+            if gpio21_level and gpio21_level != current_gpio21:
+                gui.send(f"GPIO_OUTPUT GPIO 21 LEVEL {gpio21_level}")
+                _sleep_cmd(CMD_DELAY)
+                current_gpio21 = gpio21_level
+
+            gui.send(_build_tx_config_cmd(config))
+            _sleep_cmd(CMD_DELAY)
+            gui.start_tx()
+            _sleep_cmd(CMD_DELAY)
+            started_tx = True
+            cpow, pwr_tar, edge_dbm, marker_freq_hz = _tune_bandedge_max_power_target(
+                inst,
+                gui,
+                f0_hz=f0_hz,
+                edge_hz=edge_hz,
+                side=side,
+                channel_bw_hz=channel_bw_hz,
+                loss_table=loss_table,
+            )
+        else:
+            cpow = measure_cpow_20m(
+                inst,
+                f0_hz,
+                loss_table=loss_table,
+                channel_bw_hz=channel_bw_hz,
+            )
+            edge_res = measure_bandedge_side_max(
+                inst,
+                _ensure_fsv_initialized,
+                edge_hz=edge_hz,
+                side="LEFT" if side == "LEFT" else "RIGHT",
+                loss_table=loss_table,
+            )
+            edge_dbm = float(edge_res["power_dbm"])
+            marker_freq_hz = float(edge_res["freq_hz"])
+
+        row_map["Pwr"] = f"{cpow:.1f}"
+        if pwr_tar is not None:
+            row_map["PwrTar"] = f"{pwr_tar:.1f}"
+        if edge_dbm is not None:
+            row_map[edge_label] = f"{edge_dbm:.1f}"
+        if marker_freq_hz is not None:
+            row_map["MarkerFreq"] = f"{marker_freq_hz/1e6:.1f}"
+        _flush_pending_block_headers()
+        rows_out.append([row_map.get(col, "") for col in header])
+        if gui and started_tx:
+            gui.stop_tx()
+            _sleep_cmd(CMD_DELAY)
+
+    rows = _read_table_rows(input_path)
+    gui_rows: set = set()
+    for idx, row in enumerate(rows):
+        if not row or all(not str(c).strip() for c in row):
+            continue
+        upper = [str(c).strip().upper() for c in row]
+        if "GUI_ADDRESS" in upper or "GUI HOST" in upper:
+            gui_header_idx = idx
+            gui_value_idx = None
+            for j in range(idx + 1, len(rows)):
+                r2 = rows[j]
+                if not r2 or all(not str(c).strip() for c in r2):
+                    continue
+                gui_value_idx = j
+                break
+            if gui_value_idx is not None:
+                gui_rows.add(gui_header_idx)
+                gui_rows.add(gui_value_idx)
+                rows_out.append(rows[gui_header_idx])
+                rows_out.append(rows[gui_value_idx])
+            break
+
+    for idx, row in enumerate(rows):
+        if idx in gui_rows:
+            continue
+        if not row or all(not str(c).strip() for c in row):
+            rows_out.append(row)
+            continue
+
+        if pending_config_header is not None:
+            defaults = dict(base_defaults)
+            _apply_config_header_row(pending_config_header, row, defaults)
+            header = None
+            bandedge_cols = []
+            pending_config_header = None
+            pending_config_value_row = row
+            continue
+
+        if any(":" in c for c in row):
+            defaults = dict(base_defaults)
+            for cell in row:
+                _parse_config_cell(cell, defaults)
+            header = None
+            bandedge_cols = []
+            pending_config_header_row = None
+            pending_config_value_row = None
+            pending_header_row = None
+            rows_out.append(row)
+            continue
+
+        if _is_config_header_row(row):
+            # New block begins; drop previous pending block headers if it had no data rows.
+            pending_config_header_row = None
+            pending_config_value_row = None
+            pending_header_row = None
+            pending_config_header = row
+            pending_config_header_row = row
+            continue
+
+        if row[0].strip().upper() == "CH":
+            header = [c.strip() for c in row]
+            if "MarkerFreq" not in header:
+                header.append("MarkerFreq")
+            marker_idx = header.index("MarkerFreq")
+            target_idx = max(0, marker_idx - 2)
+            if target_idx != marker_idx:
+                marker_col = header.pop(marker_idx)
+                header.insert(target_idx, marker_col)
+            bandedge_cols = _extract_bandedge_columns(header)
+            pending_header_row = list(header)
+            continue
+
+        if not header:
+            rows_out.append(row)
+            continue
+
+        row_map = {header[i]: row[i].strip() if i < len(row) else "" for i in range(len(header))}
+        if not _get_cell(row_map, "CH"):
+            rows_out.append(row)
+            continue
+
+        config = dict(defaults)
+        for col, val in row_map.items():
+            if not val:
+                continue
+            norm = _normalize_key(col)
+            if not norm:
+                continue
+            if norm == "CHAN":
+                chan = _parse_chan(val)
+                if chan is not None:
+                    config[norm] = chan
+                continue
+            if norm in {"OFFSET"}:
+                try:
+                    config[norm] = float(val)
+                except Exception:
+                    pass
+                continue
+            if norm in {"DUTY_CYCLE", "PSDU_LEN", "PAYLOAD", "PAYLOAD_LEN"}:
+                try:
+                    config[norm] = int(float(val))
+                except Exception:
+                    pass
+                continue
+            if norm in {"FIRMWARE_TYPE", "TEST_MODE", "PACKET_TYPE"}:
+                if norm == "FIRMWARE_TYPE":
+                    config[norm] = _normalize_firmware_type(val, default="WIFI")
+                elif norm == "PACKET_TYPE":
+                    config[norm] = _normalize_bt_packet_type(val)
+                else:
+                    config[norm] = str(val).strip().upper()
+                continue
+            config[norm] = val
+
+        antenna_cfg = str(config.get("ANTENNA", "")).strip().upper()
+        if profile_key != "DULE_ANTENNA" and antenna_cfg == "ANT2":
+            # SINGLE_BAND / DULE_BAND do not support ANT2 path in bandedge run.
+            continue
+
+        freq_cell = _get_cell(row_map, "Freq")
+        if not freq_cell:
+            rows_out.append(row)
+            continue
+        try:
+            f0_hz = float(freq_cell) * 1e6
+        except Exception:
+            rows_out.append(row)
+            continue
+        if f0_hz < 3e9 and not band_24:
+            continue
+        if f0_hz >= 4e9 and not band_5:
+            continue
+        _process_row(row_map, config, f0_hz)
+
+    _write_table_rows(output_path, rows_out, template_path=input_path)
+
 def run_csv_test(
     input_path: str,
     output_path: str,
@@ -1385,6 +1956,8 @@ def run_csv_test(
     cal_scope_step: Optional[float] = None,
     band_24: bool = True,
     band_5: bool = True,
+    test_harmonic: bool = True,
+    test_bandedge: bool = True,
     flow_mode: str = "WIFI",
 ) -> None:
     rows_out: List[List[str]] = []
@@ -1414,6 +1987,7 @@ def run_csv_test(
     loss_table = cable_loss_table or []
     use_scope = (
         flow_mode.upper() != "BT"
+        and test_harmonic
         and
         cal_scope_min is not None
         and cal_scope_max is not None
@@ -1421,6 +1995,8 @@ def run_csv_test(
         and cal_scope_step > 0
         and gui is not None
     )
+    run_harmonic_test = (flow_mode.upper() == "BT") or test_harmonic
+    use_wifi_bandedge = (flow_mode.upper() != "BT") and test_bandedge
     offsets = _build_cal_power_offsets(cal_scope_min, cal_scope_max, cal_scope_step) if use_scope else [0.0]
     block_rows: List[Dict[str, object]] = []
 
@@ -1431,6 +2007,7 @@ def run_csv_test(
         row_map = dict(entry["row_map"])
         config = entry["config"]
         f0_hz = entry["f0_hz"]
+        channel_bw_hz = _parse_wifi_channel_bw_hz(config.get("BW"), default_hz=20e6)
         started_tx = False
         desired_target = None
         power_tar_final = None
@@ -1569,10 +2146,16 @@ def run_csv_test(
                         desired_target=desired_target,
                         cmd_delay=CMD_DELAY,
                         loss_table=loss_table,
+                        channel_bw_hz=channel_bw_hz,
                     )
                 last_calibration[cache_key] = (cpow, power_tar_final)
         else:
-            cpow = measure_cpow_20m(inst, f0_hz, loss_table=loss_table)
+            cpow = measure_cpow_20m(
+                inst,
+                f0_hz,
+                loss_table=loss_table,
+                channel_bw_hz=channel_bw_hz,
+            )
 
         row_map["Pwr"] = f"{cpow:.1f}"
         if flow_mode.upper() == "BT":
@@ -1589,7 +2172,7 @@ def run_csv_test(
             print(f"[INFO] Cal Pwr={desired_target} Pwr={cpow:.1f} PwrTar={pwr_tar_text}")
             return True
 
-        if harmonics:
+        if run_harmonic_test and harmonics:
             inst.query("SENS:FREQ:SPAN?")
             orders = [h[0] for h in harmonics]
             order_strs = [h[1] for h in harmonics]
@@ -1608,6 +2191,17 @@ def run_csv_test(
                 row_map[key] = f"{item['best']['power']:.1f}"
                 if flow_mode.upper() == "BT":
                     row_map[f"{key}_BT"] = f"{item['best']['power']:.1f}"
+
+        if use_wifi_bandedge:
+            bandedge_results = measure_wifi_bandedges(
+                inst,
+                f0_hz,
+                _ensure_fsv_initialized,
+                loss_table=loss_table,
+            )
+            for col in WIFI_BANDEDGE_COLUMNS:
+                if col in bandedge_results:
+                    row_map[col] = f"{bandedge_results[col]:.1f}"
 
         out_row = [row_map.get(col, "") for col in header]
         rows_out.append(out_row)
@@ -1716,8 +2310,12 @@ def run_csv_test(
             if _process_block():
                 return
             header = [c.strip() for c in row]
+            if use_wifi_bandedge:
+                for col in WIFI_BANDEDGE_COLUMNS:
+                    if col not in header:
+                        header.append(col)
             harmonics = _extract_harmonic_columns(header)
-            pending_header_row = header
+            pending_header_row = list(header)
             continue
 
         if not header:
@@ -2027,6 +2625,14 @@ def _get_result_dir() -> Path:
     return _get_base_dir() / RESULT_DIR_NAME
 
 
+def _get_result_bandedge_dir() -> Path:
+    return _get_base_dir() / RESULT_DIR_BANDEDGE_NAME
+
+
+def _get_result_bt_dir() -> Path:
+    return _get_base_dir() / RESULT_DIR_BT_NAME
+
+
 def _get_last_dut_path() -> Path:
     return _get_config_dir() / "last_dut_name.txt"
 
@@ -2075,21 +2681,27 @@ def _resolve_config_resource(name: str) -> Path:
     return bundle_root / name
 
 
-def _select_profile_files(profile: str, flow_mode: str) -> Tuple[str, str, str]:
+def _select_profile_files(profile: str, flow_mode: str, test_type: str = "HARMONIC") -> Tuple[str, str, str]:
     mode = flow_mode.strip().upper()
+    test_key = test_type.strip().upper()
+    profile_key = profile.strip().upper()
+    profile_loss_table = LOSS_TABLE_PATH_DULE_ANTENNA if profile_key == "DULE_ANTENNA" else LOSS_TABLE_PATH
     if mode == "BT":
         input_csv_name = INPUT_CSV_BT_BLE
         output_csv_name = OUTPUT_CSV_BT
         loss_table_name = LOSS_TABLE_PATH
         return input_csv_name, output_csv_name, loss_table_name
 
+    if mode == "WIFI" and test_key == "BANDEDGE":
+        return INPUT_CSV_BANDEDGE, OUTPUT_CSV_BANDEDGE, profile_loss_table
+
     input_csv_name = INPUT_CSV_SINGLE_BAND
     output_csv_name = OUTPUT_CSV
-    loss_table_name = LOSS_TABLE_PATH
-    if profile == "DULE_BAND":
+    loss_table_name = profile_loss_table
+    if profile_key == "DULE_BAND":
         input_csv_name = INPUT_CSV_DULE_BAND
         output_csv_name = f"DULE_BAND_{OUTPUT_CSV}"
-    elif profile == "Dule_Antenna":
+    elif profile_key == "DULE_ANTENNA":
         input_csv_name = INPUT_CSV_DULE_ANTENNA
         output_csv_name = f"Dule_Antenna_{OUTPUT_CSV}"
         loss_table_name = LOSS_TABLE_PATH_DULE_ANTENNA
@@ -2108,6 +2720,8 @@ def main():
         cal_scope_step,
         band_24,
         band_5,
+        test_harmonic,
+        test_bandedge,
         selected_connect_type,
         selected_firmware_type,
     ) = _prompt_user_inputs()
@@ -2123,28 +2737,64 @@ def main():
 
     jobs: List[Dict[str, object]] = []
     for flow_mode in flow_plan:
-        input_csv_name, output_csv_name, loss_table_name = _select_profile_files(profile, flow_mode)
-        jobs.append(
-            {
-                "flow_mode": flow_mode,
-                "input_csv_name": input_csv_name,
-                "output_csv_name": output_csv_name,
-                "loss_table_name": loss_table_name,
-            }
-        )
+        mode_key = flow_mode.strip().upper()
+        if mode_key == "BT":
+            input_csv_name, output_csv_name, loss_table_name = _select_profile_files(
+                profile, flow_mode, test_type="HARMONIC"
+            )
+            jobs.append(
+                {
+                    "flow_mode": flow_mode,
+                    "test_type": "HARMONIC",
+                    "input_csv_name": input_csv_name,
+                    "output_csv_name": output_csv_name,
+                    "loss_table_name": loss_table_name,
+                }
+            )
+            continue
+
+        if test_harmonic:
+            input_csv_name, output_csv_name, loss_table_name = _select_profile_files(
+                profile, flow_mode, test_type="HARMONIC"
+            )
+            jobs.append(
+                {
+                    "flow_mode": flow_mode,
+                    "test_type": "HARMONIC",
+                    "input_csv_name": input_csv_name,
+                    "output_csv_name": output_csv_name,
+                    "loss_table_name": loss_table_name,
+                }
+            )
+        if test_bandedge:
+            input_csv_name, output_csv_name, loss_table_name = _select_profile_files(
+                profile, flow_mode, test_type="BANDEDGE"
+            )
+            jobs.append(
+                {
+                    "flow_mode": flow_mode,
+                    "test_type": "BANDEDGE",
+                    "input_csv_name": input_csv_name,
+                    "output_csv_name": output_csv_name,
+                    "loss_table_name": loss_table_name,
+                }
+            )
 
     xlsx_paths: List[str] = []
     for job in jobs:
         xlsx_paths.append(str(job["input_csv_name"]))
         xlsx_paths.append(str(job["output_csv_name"]))
+    if not jobs:
+        print("[WARN] No test task selected. Nothing to run.")
+        return
     if not _ensure_xlsx_support(xlsx_paths):
         return
 
     for job in jobs:
         input_path = _resolve_config_resource(str(job["input_csv_name"]))
-        if str(job["flow_mode"]).upper() == "BT" and not input_path.exists():
+        if not input_path.exists():
             raise FileNotFoundError(
-                f"BT config file not found: {input_path}. "
+                f"Config file not found: {input_path}. "
                 f"Expected file name: {job['input_csv_name']}"
             )
         job["input_path"] = input_path
@@ -2161,6 +2811,10 @@ def main():
     config_dir.mkdir(parents=True, exist_ok=True)
     result_dir = _get_result_dir()
     result_dir.mkdir(parents=True, exist_ok=True)
+    result_bandedge_dir = _get_result_bandedge_dir()
+    result_bandedge_dir.mkdir(parents=True, exist_ok=True)
+    result_bt_dir = _get_result_bt_dir()
+    result_bt_dir.mkdir(parents=True, exist_ok=True)
     first_job = jobs[0]
     gui_host = str(first_job.get("csv_gui_host") or GUI_HOST)
     gui_port = int(first_job.get("csv_gui_port") or GUI_PORT)
@@ -2206,11 +2860,18 @@ def main():
 
         for idx, job in enumerate(jobs):
             flow_mode = str(job["flow_mode"])
+            test_type = str(job.get("test_type") or "HARMONIC").strip().upper()
             input_path = Path(job["input_path"])
             output_csv_name = str(job["output_csv_name"])
-            output_path = str(result_dir / output_csv_name)
+            if flow_mode.upper() == "BT":
+                output_base_dir = result_bt_dir
+            elif test_type == "BANDEDGE":
+                output_base_dir = result_bandedge_dir
+            else:
+                output_base_dir = result_dir
+            output_path = str(output_base_dir / output_csv_name)
             if dut_name:
-                output_path = str(result_dir / f"{dut_name}_{output_csv_name}")
+                output_path = str(output_base_dir / f"{dut_name}_{output_csv_name}")
             output_path = _append_timestamp(output_path)
 
             loss_path = _resolve_config_resource(str(job["loss_table_name"]))
@@ -2224,22 +2885,39 @@ def main():
             effective_connect_type = selected_connect_type or csv_connect_type
             default_fw = "BLE" if flow_mode.upper() == "BT" else "WIFI"
 
-            print(f"[INFO] Starting {flow_mode} test with config: {input_path.name}")
-            run_csv_test(
-                str(input_path),
-                output_path,
-                inst,
-                gui,
-                default_connect_type=effective_connect_type,
-                default_firmware_type=default_fw,
-                cable_loss_table=cable_loss_table,
-                cal_scope_min=cal_scope_min,
-                cal_scope_max=cal_scope_max,
-                cal_scope_step=cal_scope_step,
-                band_24=band_24,
-                band_5=band_5,
-                flow_mode=flow_mode,
-            )
+            print(f"[INFO] Starting {flow_mode} {test_type} test with config: {input_path.name}")
+            if flow_mode.upper() == "WIFI" and test_type == "BANDEDGE":
+                run_bandedge_test(
+                    input_path=str(input_path),
+                    output_path=output_path,
+                    inst=inst,
+                    gui=gui,
+                    default_connect_type=effective_connect_type,
+                    default_firmware_type=default_fw,
+                    cable_loss_table=cable_loss_table,
+                    band_24=band_24,
+                    band_5=band_5,
+                    profile=profile,
+                    flow_mode=flow_mode,
+                )
+            else:
+                run_csv_test(
+                    str(input_path),
+                    output_path,
+                    inst,
+                    gui,
+                    default_connect_type=effective_connect_type,
+                    default_firmware_type=default_fw,
+                    cable_loss_table=cable_loss_table,
+                    cal_scope_min=cal_scope_min,
+                    cal_scope_max=cal_scope_max,
+                    cal_scope_step=cal_scope_step,
+                    band_24=band_24,
+                    band_5=band_5,
+                    test_harmonic=True,
+                    test_bandedge=False,
+                    flow_mode=flow_mode,
+                )
             written_results.append((output_path, str(input_path)))
             has_next_job = idx < (len(jobs) - 1)
             if has_next_job and gui:
