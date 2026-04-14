@@ -19,7 +19,6 @@ import re
 import subprocess
 from copy import copy
 import tkinter as tk
-from tkinter import simpledialog
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
 import csv
@@ -65,6 +64,11 @@ DEFAULT_TX_CONFIG: Dict[str, object] = {
     "CONNECT_TYPE": "USB",
     "ANTENNA": "",
     "CERTIFICATION_MODE": "",
+    "FIRMWARE_TYPE": "WIFI",
+    "TEST_MODE": "TX",
+    "PACKET_TYPE": "",
+    "PAYLOAD": 0,
+    "PAYLOAD_LEN": 37,
 }
 
 KEY_ALIASES = {
@@ -87,6 +91,52 @@ KEY_ALIASES = {
     "CERTIFICATION": "CERTIFICATION_MODE",
     "CERTIFICATION MODE": "CERTIFICATION_MODE",
     "CERTIFICATION_MODE": "CERTIFICATION_MODE",
+    "FIRMWARE TYPE": "FIRMWARE_TYPE",
+    "FIRMWARE_TYPE": "FIRMWARE_TYPE",
+    "TEST MODE": "TEST_MODE",
+    "TEST_MODE": "TEST_MODE",
+    "PACKET TYPE": "PACKET_TYPE",
+    "PACKET_TYPE": "PACKET_TYPE",
+    "PAYLOAD": "PAYLOAD",
+    "PAYLOAD LEN": "PAYLOAD_LEN",
+    "PAYLOAD_LEN": "PAYLOAD_LEN",
+}
+
+FIRMWARE_TYPES = {"WIFI", "BLE", "WIFI_AND_BLE"}
+TEST_MODES = {"TX", "RX"}
+BT_PACKET_TYPES = {
+    "BT_BLE_1M",
+    "BT_BLE_2M",
+    "BT_BLE_S8",
+    "BT_BLE_S2",
+    "BT_ID",
+    "BT_NULL",
+    "BT_POLL",
+    "BT_FHS",
+    "BT_DM1",
+    "BT_DH1",
+    "BT_2_DH1",
+    "BT_HV1",
+    "BT_HV2",
+    "BT_2_EV3",
+    "BT_HV3",
+    "BT_EV3",
+    "BT_3_EV3",
+    "BT_DV",
+    "BT_3_DH1",
+    "BT_AUX1",
+    "BT_DM3",
+    "BT_2_DH3",
+    "BT_DH3",
+    "BT_3_DH3",
+    "BT_EV4",
+    "BT_2_EV5",
+    "BT_EV5",
+    "BT_3_EV5",
+    "BT_DM5",
+    "BT_2_DH5",
+    "BT_DH5",
+    "BT_3_DH5",
 }
 
 F0_HZ_DEFAULT = 2.412e9      # 默认 2412 MHz 基波
@@ -417,19 +467,73 @@ def _normalize_connect_type(value: str) -> Optional[str]:
     return cleaned or None
 
 
-def _prompt_dut_name() -> str:
+def _prompt_dut_name() -> Tuple[str, str]:
     try:
         root = tk.Tk()
         root.withdraw()
-        root.attributes("-topmost", True)
-        name = simpledialog.askstring("Input DUT", "Input DUT name (e.g. oceanus):")
+        dialog = tk.Toplevel(root)
+        dialog.title("DUT Setup")
+        dialog.attributes("-topmost", True)
+        dialog.resizable(False, False)
+
+        tk.Label(dialog, text="DUT name").grid(row=0, column=0, padx=12, pady=(12, 6), sticky="w")
+        name_var = tk.StringVar(value="")
+        name_entry = tk.Entry(dialog, textvariable=name_var, width=28)
+        name_entry.grid(row=0, column=1, padx=12, pady=(12, 6), sticky="w")
+
+        tk.Label(dialog, text="Test type").grid(row=1, column=0, padx=12, pady=(4, 6), sticky="w")
+        firmware_var = tk.StringVar(value="WIFI")
+        radios = [
+            ("WIFI", "WIFI"),
+            ("BT", "BLE"),
+            ("WIFI + BT", "WIFI_AND_BLE"),
+        ]
+        radio_frame = tk.Frame(dialog)
+        radio_frame.grid(row=1, column=1, padx=12, pady=(4, 6), sticky="w")
+        for i, (label, value) in enumerate(radios):
+            tk.Radiobutton(radio_frame, text=label, variable=firmware_var, value=value).grid(
+                row=0, column=i, padx=(0, 10), sticky="w"
+            )
+
+        result = {"value": ("", "WIFI")}
+
+        def on_ok() -> None:
+            name = (name_var.get() or "").strip()
+            fw = firmware_var.get().strip().upper() or "WIFI"
+            result["value"] = (name, fw)
+            dialog.destroy()
+
+        def on_cancel() -> None:
+            result["value"] = ("", firmware_var.get().strip().upper() or "WIFI")
+            dialog.destroy()
+
+        btn_frame = tk.Frame(dialog)
+        btn_frame.grid(row=2, column=0, columnspan=2, pady=(6, 12))
+        tk.Button(btn_frame, text="OK", width=8, command=on_ok).pack(side="left", padx=6)
+        tk.Button(btn_frame, text="Cancel", width=8, command=on_cancel).pack(side="left", padx=6)
+
+        dialog.protocol("WM_DELETE_WINDOW", on_cancel)
+        dialog.grab_set()
+        name_entry.focus_set()
+        root.wait_window(dialog)
         root.destroy()
-        return (name or "").strip()
+        return result["value"]
     except Exception:
         try:
-            return input("Input DUT name (e.g. oceanus): ").strip()
+            name = input("Input DUT name (e.g. oceanus): ").strip()
         except Exception:
-            return ""
+            name = ""
+        try:
+            raw = input("Select test type [WIFI/BT/BOTH] (default WIFI): ").strip().upper()
+        except Exception:
+            raw = "WIFI"
+        if raw == "BT":
+            firmware_type = "BLE"
+        elif raw in {"BOTH", "WIFI+BT", "WIFI_AND_BT", "WIFI_AND_BLE"}:
+            firmware_type = "WIFI_AND_BLE"
+        else:
+            firmware_type = "WIFI"
+        return name, firmware_type
 
 
 def _read_table_rows(path: str) -> List[List[str]]:
@@ -700,12 +804,15 @@ def run_csv_test(
     inst: FsvSocket,
     gui,
     default_connect_type: Optional[str] = None,
+    default_firmware_type: Optional[str] = None,
     cable_loss_table: Optional[List[Tuple[float, float, float]]] = None,
 ) -> None:
     rows_out: List[List[str]] = []
     base_defaults = dict(DEFAULT_TX_CONFIG)
     if default_connect_type:
         base_defaults["CONNECT_TYPE"] = default_connect_type
+    if default_firmware_type in FIRMWARE_TYPES:
+        base_defaults["FIRMWARE_TYPE"] = default_firmware_type
     defaults = dict(base_defaults)
     header: Optional[List[str]] = None
     harmonics: List[Tuple[float, str]] = []
@@ -1149,7 +1256,7 @@ def main():
     result_dir = _get_result_dir()
     result_dir.mkdir(parents=True, exist_ok=True)
     output_path = str(result_dir / OUTPUT_CSV)
-    dut_name = _prompt_dut_name()
+    dut_name, selected_firmware_type = _prompt_dut_name()
     if dut_name:
         output_path = str(result_dir / f"{dut_name}_{OUTPUT_CSV}")
     loss_path = _resolve_config_resource(LOSS_TABLE_PATH)
@@ -1197,6 +1304,7 @@ def main():
             inst,
             gui,
             default_connect_type=csv_connect_type,
+            default_firmware_type=selected_firmware_type,
             cable_loss_table=cable_loss_table,
         )
 

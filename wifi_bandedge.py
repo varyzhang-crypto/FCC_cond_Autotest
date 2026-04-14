@@ -43,7 +43,7 @@ def _measure_one_bandedge(
     f_center_hz: float,
     att_list: List[int],
     span_hz: float = 20e6,
-    ref_level_dbm: float = 20.0,
+    ref_level_dbm: float = 25.0,
     loss_table: Optional[List[Tuple[float, float, float]]] = None,
 ) -> Dict[str, Any]:
     results: List[Dict[str, float]] = []
@@ -143,7 +143,7 @@ def measure_bandedge_side_max(
     edge_hz: float,
     side: Literal["LEFT", "RIGHT"],
     span_hz: float = 20e6,
-    ref_level_dbm: float = 20.0,
+    ref_level_dbm: float = 25.0,
     loss_table: Optional[List[Tuple[float, float, float]]] = None,
 ) -> Dict[str, float]:
     ensure_fsv_initialized(inst)

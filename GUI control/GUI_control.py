@@ -197,6 +197,9 @@ class GuiSocketClient:
     def power_get(self) -> str:
         return self.query("POWER_GET")
 
+    def bt_power_get(self) -> str:
+        return self.query("BT_POWER_GET")
+
     def select_firmware(self, pathfile: str) -> None:
         clean = pathfile.strip()
         if not clean:
@@ -231,6 +234,7 @@ Commands:
   READ_DCXO
   POWER_TARGET POWER <float>
   POWER_GET
+  BT_POWER_GET
   SELECT_FIRMWARE PATHFILE <path>
   ANTENNA ANT <ANT1/ANT2/ALL>
   CERTIFICATION MODE <NORMAL/CE/FCC/SRRC/SRRC_2>
@@ -262,7 +266,7 @@ def run_repl(client: GuiSocketClient) -> None:
 
         first = cmd_upper.split()[0]
         try:
-            if first in {"READ_DCXO", "POWER_GET", "GET_VERSION"}:
+            if first in {"READ_DCXO", "POWER_GET", "BT_POWER_GET", "GET_VERSION"}:
                 resp = client.query(line)
                 print(resp)
             else:
