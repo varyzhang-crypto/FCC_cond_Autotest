@@ -13,13 +13,14 @@ class COLLECT_WITH_INTERNAL(_COLLECT):
         internal_dir = os.path.join(dist_dir, "_internal")
         # PyInstaller's default onedir layout keeps dependencies in _internal.
         # Move config/result out to top-level so they sit next to the exe.
-        for name in ("config", "result"):
+        for name in ("config", "result", "result_bandedge", "result_bt"):
             src = os.path.join(internal_dir, name)
             dst = os.path.join(dist_dir, name)
             if os.path.exists(src):
                 if os.path.exists(dst):
                     shutil.rmtree(dst, ignore_errors=True)
-                shutil.move(src, dst)
+                shutil.copytree(src, dst, dirs_exist_ok=True)
+                shutil.rmtree(src, ignore_errors=True)
 
 
 a = Analysis(
@@ -30,10 +31,14 @@ a = Analysis(
         ('config\\loss.txt', 'config'),
         ('config\\loss_C3cable.txt', 'config'),
         ('config\\loss_Dule_Antenna.txt', 'config'),
+        ('config\\FCC_test_item_BT_BLE.xlsx', 'config'),
+        ('config\\FCC_test_item_Bandedge.xlsx', 'config'),
         ('config\\FCC_test_item_Dule_Antenna.xlsx', 'config'),
         ('config\\FCC_test_item_dule_band.xlsx', 'config'),
         ('config\\FCC_test_item_single_band.xlsx', 'config'),
         ('result\\.keep', 'result'),
+        ('result_bandedge\\.keep', 'result_bandedge'),
+        ('result_bt\\.keep', 'result_bt'),
         ('GUI control\\GUI_control.py', 'GUI control'),
     ],
     hiddenimports=[],
