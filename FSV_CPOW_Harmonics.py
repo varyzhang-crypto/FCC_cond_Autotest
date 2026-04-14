@@ -20,7 +20,7 @@ import re
 import subprocess
 from copy import copy
 import tkinter as tk
-from tkinter import simpledialog
+from tkinter import simpledialog, filedialog, messagebox
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
 import csv
@@ -41,6 +41,8 @@ GUI_PORT = 7481
 GUI_TIMEOUT = 5.0
 USE_GUI_CALIBRATION = True
 CMD_DELAY = 1.0
+CONNECT_SETTLE_S = 4.0
+BT_TXCFG_TO_START_DELAY_S = 2.0
 TX_START_STABLE_S = 0.8
 FW_SWITCH_DISCONNECT_S = 0.8
 FW_SWITCH_SETTLE_S = 3.0
@@ -686,6 +688,7 @@ def _prompt_user_inputs() -> Tuple[
     bool,
     str,
     str,
+    Optional[str],
 ]:
     try:
         root = tk.Tk()
@@ -708,80 +711,98 @@ def _prompt_user_inputs() -> Tuple[
             row=2, column=1, columnspan=3, sticky="w", padx=12, pady=(4, 4)
         )
 
-        tk.Label(dialog, text="Firmware type:").grid(row=3, column=0, sticky="w", padx=12, pady=(4, 4))
+        tk.Label(dialog, text="GUI ADDRESS:").grid(row=3, column=0, sticky="w", padx=12, pady=(4, 4))
+        gui_address_var = tk.StringVar(value=GUI_EXE_PATH)
+        gui_address_entry = tk.Entry(dialog, textvariable=gui_address_var, width=44)
+        gui_address_entry.grid(row=3, column=1, columnspan=2, sticky="we", padx=12, pady=(4, 4))
+
+        def _browse_gui_address() -> None:
+            selected = filedialog.askopenfilename(
+                parent=dialog,
+                title="Select GUI EXE",
+                filetypes=[("Executable", "*.exe"), ("All files", "*.*")],
+            )
+            if selected:
+                gui_address_var.set(selected)
+
+        tk.Button(dialog, text="Browse...", width=10, command=_browse_gui_address).grid(
+            row=3, column=3, sticky="w", padx=(0, 12), pady=(4, 4)
+        )
+
+        tk.Label(dialog, text="Firmware type:").grid(row=4, column=0, sticky="w", padx=12, pady=(4, 4))
         firmware_type_var = tk.StringVar(value="WIFI")
         firmware_wifi_rb = tk.Radiobutton(dialog, text="WIFI", variable=firmware_type_var, value="WIFI")
         firmware_wifi_rb.grid(
-            row=3, column=1, sticky="w", padx=12
+            row=4, column=1, sticky="w", padx=12
         )
         firmware_bt_rb = tk.Radiobutton(dialog, text="BT", variable=firmware_type_var, value="BLE")
         firmware_bt_rb.grid(
-            row=3, column=2, sticky="w", padx=12
+            row=4, column=2, sticky="w", padx=12
         )
         firmware_both_rb = tk.Radiobutton(
             dialog, text="WIFI+BT", variable=firmware_type_var, value="WIFI_AND_BLE"
         )
         firmware_both_rb.grid(
-            row=3, column=3, sticky="w", padx=12
+            row=4, column=3, sticky="w", padx=12
         )
 
-        tk.Label(dialog, text="Profile:").grid(row=4, column=0, sticky="w", padx=12, pady=(4, 4))
+        tk.Label(dialog, text="Profile:").grid(row=5, column=0, sticky="w", padx=12, pady=(4, 4))
         profile_var = tk.StringVar(value="SINGLE_BAND")
         profile_single_rb = tk.Radiobutton(dialog, text="SINGLE_BAND", variable=profile_var, value="SINGLE_BAND")
         profile_single_rb.grid(
-            row=5, column=0, sticky="w", padx=12
+            row=6, column=0, sticky="w", padx=12
         )
         profile_dule_band_rb = tk.Radiobutton(dialog, text="DULE_BAND", variable=profile_var, value="DULE_BAND")
         profile_dule_band_rb.grid(
-            row=5, column=1, sticky="w", padx=12
+            row=6, column=1, sticky="w", padx=12
         )
         profile_dule_ant_rb = tk.Radiobutton(
             dialog, text="Dule_Antenna", variable=profile_var, value="Dule_Antenna"
         )
         profile_dule_ant_rb.grid(
-            row=5, column=2, sticky="w", padx=12
+            row=6, column=2, sticky="w", padx=12
         )
 
-        tk.Label(dialog, text="Band:").grid(row=6, column=0, sticky="w", padx=12, pady=(6, 4))
+        tk.Label(dialog, text="Band:").grid(row=7, column=0, sticky="w", padx=12, pady=(6, 4))
         band_24_var = tk.BooleanVar(value=True)
         band_5_var = tk.BooleanVar(value=True)
         band_24_cb = tk.Checkbutton(dialog, text="2.4G", variable=band_24_var)
-        band_24_cb.grid(row=6, column=1, sticky="w", padx=6)
+        band_24_cb.grid(row=7, column=1, sticky="w", padx=6)
         band_5_cb = tk.Checkbutton(dialog, text="5G", variable=band_5_var)
-        band_5_cb.grid(row=6, column=2, sticky="w", padx=6)
+        band_5_cb.grid(row=7, column=2, sticky="w", padx=6)
 
-        tk.Label(dialog, text="Test:").grid(row=7, column=0, sticky="w", padx=12, pady=(6, 4))
+        tk.Label(dialog, text="Test:").grid(row=8, column=0, sticky="w", padx=12, pady=(6, 4))
         harmonic_test_var = tk.BooleanVar(value=True)
         bandedge_test_var = tk.BooleanVar(value=True)
         harmonic_test_cb = tk.Checkbutton(dialog, text="Harmonic", variable=harmonic_test_var)
         harmonic_test_cb.grid(
-            row=7, column=1, sticky="w", padx=6
+            row=8, column=1, sticky="w", padx=6
         )
         bandedge_test_cb = tk.Checkbutton(dialog, text="Bandedge", variable=bandedge_test_var)
         bandedge_test_cb.grid(
-            row=7, column=2, sticky="w", padx=6
+            row=8, column=2, sticky="w", padx=6
         )
 
         enable_var = tk.BooleanVar(value=False)
         cal_scope_cb = tk.Checkbutton(dialog, text="Cal Power Scope", variable=enable_var)
         cal_scope_cb.grid(
-            row=8, column=0, columnspan=4, sticky="w", padx=12, pady=(8, 4)
+            row=9, column=0, columnspan=4, sticky="w", padx=12, pady=(8, 4)
         )
 
-        tk.Label(dialog, text="Min").grid(row=9, column=0, sticky="w", padx=12)
+        tk.Label(dialog, text="Min").grid(row=10, column=0, sticky="w", padx=12)
         min_var = tk.StringVar(value="-1")
         min_entry = tk.Entry(dialog, textvariable=min_var, width=8)
-        min_entry.grid(row=9, column=1, padx=6, pady=4)
+        min_entry.grid(row=10, column=1, padx=6, pady=4)
 
-        tk.Label(dialog, text="Max").grid(row=9, column=2, sticky="w", padx=6)
+        tk.Label(dialog, text="Max").grid(row=10, column=2, sticky="w", padx=6)
         max_var = tk.StringVar(value="0")
         max_entry = tk.Entry(dialog, textvariable=max_var, width=8)
-        max_entry.grid(row=9, column=3, padx=6, pady=4)
+        max_entry.grid(row=10, column=3, padx=6, pady=4)
 
-        tk.Label(dialog, text="Step").grid(row=10, column=0, sticky="w", padx=12)
+        tk.Label(dialog, text="Step").grid(row=11, column=0, sticky="w", padx=12)
         step_var = tk.StringVar(value="1")
         step_entry = tk.Entry(dialog, textvariable=step_var, width=8)
-        step_entry.grid(row=10, column=1, padx=6, pady=4)
+        step_entry.grid(row=11, column=1, padx=6, pady=4)
 
         tip_text = (
             "SWITCH connection:\n"
@@ -790,7 +811,7 @@ def _prompt_user_inputs() -> Tuple[
             "SMA3->ANT2, SMA4->50ohm"
         )
         tk.Label(dialog, text=tip_text, justify="left").grid(
-            row=11, column=0, columnspan=4, sticky="w", padx=12, pady=(6, 4)
+            row=12, column=0, columnspan=4, sticky="w", padx=12, pady=(6, 4)
         )
 
         def _set_scope_state(enabled: bool) -> None:
@@ -868,6 +889,7 @@ def _prompt_user_inputs() -> Tuple[
                 scope_step = None
             dut_name = (name_var.get() or "").strip()
             _save_last_dut_name(dut_name)
+            selected_gui_address = (gui_address_var.get() or "").strip() or GUI_EXE_PATH
             result["value"] = (
                 dut_name,
                 profile_var.get().strip().upper(),
@@ -880,6 +902,7 @@ def _prompt_user_inputs() -> Tuple[
                 bool(bandedge_test_var.get()),
                 connect_type_var.get().strip().upper(),
                 firmware_type_var.get().strip().upper(),
+                selected_gui_address,
             )
             dialog.destroy()
 
@@ -888,7 +911,7 @@ def _prompt_user_inputs() -> Tuple[
             dialog.destroy()
 
         btn_frame = tk.Frame(dialog)
-        btn_frame.grid(row=12, column=0, columnspan=4, pady=12)
+        btn_frame.grid(row=13, column=0, columnspan=4, pady=12)
         tk.Button(btn_frame, text="OK", width=8, command=on_ok).pack(side="left", padx=6)
         tk.Button(btn_frame, text="Cancel", width=8, command=on_cancel).pack(side="left", padx=6)
 
@@ -917,6 +940,10 @@ def _prompt_user_inputs() -> Tuple[
                 connect_type = "USB"
         except Exception:
             connect_type = "USB"
+        try:
+            gui_override = input(f"GUI ADDRESS [{GUI_EXE_PATH}]: ").strip() or GUI_EXE_PATH
+        except Exception:
+            gui_override = GUI_EXE_PATH
         try:
             raw_fw = input("Firmware type (WIFI/BT/BOTH) [WIFI]: ").strip().upper()
             if raw_fw == "BT":
@@ -984,6 +1011,7 @@ def _prompt_user_inputs() -> Tuple[
                 test_bandedge,
                 connect_type,
                 firmware_type,
+                gui_override,
             )
         try:
             scope_text = input("Cal Power Scope (min max, e.g. -1 0): ").strip()
@@ -1010,7 +1038,300 @@ def _prompt_user_inputs() -> Tuple[
             test_bandedge,
             connect_type,
             firmware_type,
+            gui_override,
         )
+
+
+def _overwrite_gui_settings_in_file(path: Path, gui_address: str, gui_host: Optional[str] = None) -> bool:
+    ext = path.suffix.lower()
+    target = gui_address.strip()
+    host_target = (gui_host or "").strip()
+    if not target and not host_target:
+        return False
+    target_map: Dict[str, str] = {}
+    if target:
+        target_map["GUI ADDRESS"] = target
+    if host_target:
+        target_map["GUI HOST"] = host_target
+
+    if ext == ".xlsx":
+        try:
+            from openpyxl import load_workbook
+        except Exception as exc:
+            raise RuntimeError("openpyxl is required to update .xlsx files") from exc
+        wb = load_workbook(str(path))
+        try:
+            ws = wb.active
+            changed = False
+
+            non_empty_rows: List[int] = []
+            for row_idx in range(1, ws.max_row + 1):
+                has_value = False
+                for col_idx in range(1, ws.max_column + 1):
+                    cell_val = ws.cell(row=row_idx, column=col_idx).value
+                    if cell_val is not None and str(cell_val).strip():
+                        has_value = True
+                        break
+                if has_value:
+                    non_empty_rows.append(row_idx)
+                    if len(non_empty_rows) >= 2:
+                        break
+
+            if len(non_empty_rows) >= 2:
+                header_row_idx, value_row_idx = non_empty_rows[0], non_empty_rows[1]
+                for col_idx in range(1, ws.max_column + 1):
+                    key = ws.cell(row=header_row_idx, column=col_idx).value
+                    key_clean = str(key or "").strip().upper().replace("_", " ")
+                    if key_clean not in target_map:
+                        continue
+                    old_val = str(ws.cell(row=value_row_idx, column=col_idx).value or "").strip()
+                    new_val = target_map[key_clean]
+                    if old_val != new_val:
+                        ws.cell(row=value_row_idx, column=col_idx).value = new_val
+                        changed = True
+
+            for row_idx in range(1, ws.max_row + 1):
+                for col_idx in range(1, ws.max_column + 1):
+                    cell = ws.cell(row=row_idx, column=col_idx)
+                    raw = cell.value
+                    if raw is None:
+                        continue
+                    text = str(raw).strip()
+                    if ":" not in text:
+                        continue
+                    key, val = text.split(":", 1)
+                    key_clean = key.strip().upper().replace("_", " ")
+                    if key_clean not in target_map:
+                        continue
+                    new_val = target_map[key_clean]
+                    if val.strip() == new_val:
+                        continue
+                    cell.value = f"{key.strip()}: {new_val}"
+                    changed = True
+
+            if changed:
+                wb.save(str(path))
+            return changed
+        finally:
+            try:
+                wb.close()
+            except Exception:
+                pass
+
+    if ext == ".csv":
+        rows = _read_table_rows(str(path))
+        changed = False
+        header = None
+        values = None
+        for row in rows:
+            if not row or all(not str(c).strip() for c in row):
+                continue
+            if header is None:
+                header = row
+                continue
+            values = row
+            break
+        if header and values:
+            for i, key in enumerate(header):
+                key_clean = str(key or "").strip().upper().replace("_", " ")
+                if key_clean not in target_map:
+                    continue
+                while i >= len(values):
+                    values.append("")
+                new_val = target_map[key_clean]
+                if str(values[i] or "").strip() != new_val:
+                    values[i] = new_val
+                    changed = True
+        for row in rows:
+            for i, cell in enumerate(row):
+                text = str(cell or "").strip()
+                if ":" not in text:
+                    continue
+                key, val = text.split(":", 1)
+                key_clean = key.strip().upper().replace("_", " ")
+                if key_clean not in target_map:
+                    continue
+                new_val = target_map[key_clean]
+                if val.strip() == new_val:
+                    continue
+                row[i] = f"{key.strip()}: {new_val}"
+                changed = True
+        if changed:
+            _write_table_rows(str(path), rows)
+        return changed
+
+    return False
+
+
+def _override_all_config_gui_address(gui_address: str) -> List[Path]:
+    target = gui_address.strip()
+    if not target:
+        return []
+    config_dir = _get_config_dir()
+    if not config_dir.exists():
+        return []
+    changed_files: List[Path] = []
+    candidates = sorted(config_dir.glob("*.xlsx")) + sorted(config_dir.glob("*.csv"))
+    for cfg_path in candidates:
+        try:
+            if _overwrite_gui_settings_in_file(cfg_path, target):
+                changed_files.append(cfg_path)
+        except Exception as exc:
+            print(f"[WARN] Failed to update GUI ADDRESS in {cfg_path.name}: {exc}")
+    return changed_files
+
+
+def _override_all_config_gui_host(gui_host: str) -> List[Path]:
+    target = gui_host.strip()
+    if not target:
+        return []
+    config_dir = _get_config_dir()
+    if not config_dir.exists():
+        return []
+    changed_files: List[Path] = []
+    candidates = sorted(config_dir.glob("*.xlsx")) + sorted(config_dir.glob("*.csv"))
+    for cfg_path in candidates:
+        try:
+            if _overwrite_gui_settings_in_file(cfg_path, "", gui_host=target):
+                changed_files.append(cfg_path)
+        except Exception as exc:
+            print(f"[WARN] Failed to update GUI HOST in {cfg_path.name}: {exc}")
+    return changed_files
+
+
+def _is_valid_ipv4(ip: str) -> bool:
+    text = (ip or "").strip()
+    if not text:
+        return False
+    try:
+        socket.inet_aton(text)
+    except Exception:
+        return False
+    return text.count(".") == 3
+
+
+def _try_get_local_ipv4() -> Optional[str]:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            ip = sock.getsockname()[0]
+        if _is_valid_ipv4(ip) and not ip.startswith("127."):
+            return ip
+    except Exception:
+        pass
+    try:
+        ip = socket.gethostbyname(socket.gethostname())
+        if _is_valid_ipv4(ip) and not ip.startswith("127."):
+            return ip
+    except Exception:
+        pass
+    return None
+
+
+def _get_local_ipv4_for_gui() -> str:
+    while True:
+        ip = _try_get_local_ipv4()
+        if ip:
+            return ip
+
+        # Pause and let user choose what to do when auto detection fails.
+        try:
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            choice = messagebox.askyesnocancel(
+                "HostIP Detect Failed",
+                (
+                    "Failed to get local IP.\n\n"
+                    "Yes: Retry\n"
+                    "No: Input HostIP manually\n"
+                    "Cancel: Use default HostIP"
+                ),
+                parent=root,
+            )
+            root.destroy()
+            if choice is True:
+                continue
+            if choice is False:
+                manual = simpledialog.askstring(
+                    "Manual HostIP",
+                    "Input HostIP (IPv4):",
+                )
+                if _is_valid_ipv4(manual or ""):
+                    return (manual or "").strip()
+                messagebox.showwarning("Invalid HostIP", "Input is not a valid IPv4 address.")
+                continue
+            return GUI_HOST
+        except Exception:
+            pass
+
+        print("[WARN] Failed to get local IP automatically.")
+        print(f"[WARN] 1) Retry  2) Manual input  3) Use default ({GUI_HOST})")
+        try:
+            select = input("Select [3]: ").strip()
+        except Exception:
+            select = "3"
+        if select == "1":
+            continue
+        if select == "2":
+            try:
+                manual = input("Input HostIP (IPv4): ").strip()
+            except Exception:
+                manual = ""
+            if _is_valid_ipv4(manual):
+                return manual
+            print("[WARN] Invalid IPv4, please choose again.")
+            continue
+        return GUI_HOST
+
+
+def _sync_gui_main_ini(exe_path: Path, host_ip: str, port: int = 7481) -> Optional[Path]:
+    config_path = exe_path.parent / "Config" / "main.ini"
+    if not config_path.exists():
+        return None
+    try:
+        lines = config_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except Exception as exc:
+        print(f"[WARN] Failed to read GUI main.ini: {exc}")
+        return None
+
+    target_map = {
+        "TcpAutoCtrlServer": "1",
+        "HostIP": str(host_ip).strip(),
+        "Port": str(int(port)),
+    }
+    seen: set = set()
+    out_lines: List[str] = []
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or stripped.startswith(";") or "=" not in line:
+            out_lines.append(line)
+            continue
+        key, _ = line.split("=", 1)
+        key_clean = key.strip()
+        if key_clean in target_map:
+            out_lines.append(f"{key_clean}={target_map[key_clean]}")
+            seen.add(key_clean)
+        else:
+            out_lines.append(line)
+
+    for key in ("TcpAutoCtrlServer", "HostIP", "Port"):
+        if key not in seen:
+            out_lines.append(f"{key}={target_map[key]}")
+
+    new_text = "\n".join(out_lines)
+    old_text = "\n".join(lines)
+    if new_text != old_text:
+        try:
+            config_path.write_text(new_text + "\n", encoding="utf-8")
+            print(f"[INFO] Updated GUI main.ini: {config_path}")
+        except Exception as exc:
+            print(f"[WARN] Failed to write GUI main.ini: {exc}")
+            return None
+    return config_path
+
+
 def _prompt_cal_power_scope() -> Tuple[Optional[float], Optional[float], Optional[float]]:
     try:
         root = tk.Tk()
@@ -1735,7 +2056,7 @@ def run_bandedge_test(
             connect_type = _normalize_connect_type(str(config.get("CONNECT_TYPE", "")))
             if connect_type and connect_type != current_connect_type:
                 gui.send(f"CONNECT TYPE {connect_type}")
-                _sleep_cmd(CMD_DELAY)
+                _sleep_cmd(max(CMD_DELAY, CONNECT_SETTLE_S))
                 current_connect_type = connect_type
             antenna = str(config.get("ANTENNA", "")).strip().upper()
             cert_mode = str(config.get("CERTIFICATION_MODE", "")).strip().upper()
@@ -2030,7 +2351,7 @@ def run_csv_test(
             connect_type = _normalize_connect_type(str(config.get("CONNECT_TYPE", "")))
             if connect_type and connect_type != current_connect_type:
                 gui.send(f"CONNECT TYPE {connect_type}")
-                _sleep_cmd(CMD_DELAY)
+                _sleep_cmd(max(CMD_DELAY, CONNECT_SETTLE_S))
                 current_connect_type = connect_type
             is_bt_path = flow_mode.upper() == "BT"
 
@@ -2066,7 +2387,7 @@ def run_csv_test(
 
             if is_bt_path:
                 gui.send(_build_bt_tx_config_cmd(config))
-                _sleep_cmd(CMD_DELAY)
+                _sleep_cmd(max(CMD_DELAY, BT_TXCFG_TO_START_DELAY_S))
                 gui.send("BT_START_TX")
                 _sleep_cmd(CMD_DELAY)
                 started_tx = True
@@ -2724,8 +3045,10 @@ def main():
         test_bandedge,
         selected_connect_type,
         selected_firmware_type,
+        selected_gui_override,
     ) = _prompt_user_inputs()
     selected_fw = (selected_firmware_type or "WIFI").strip().upper()
+    selected_gui_override = (selected_gui_override or "").strip()
     enable_gui_log = selected_fw in {"BLE", "WIFI_AND_BLE"}
     flow_plan: List[str]
     if selected_fw == "BLE":
@@ -2806,6 +3129,17 @@ def main():
         job["csv_connect_type"] = csv_connect_type
         job["csv_gui_exe_path"] = csv_gui_exe_path
 
+    changed_files = _override_all_config_gui_address(selected_gui_override)
+    print(f"[INFO] GUI ADDRESS override: {selected_gui_override}")
+    if changed_files:
+        print(f"[INFO] Updated GUI ADDRESS in {len(changed_files)} config file(s).")
+        for changed in changed_files:
+            print(f"[INFO]   {changed.name}")
+    else:
+        print("[INFO] No GUI ADDRESS field changed in config files.")
+    for job in jobs:
+        job["csv_gui_exe_path"] = selected_gui_override
+
     base_dir = _get_base_dir()
     config_dir = _get_config_dir()
     config_dir.mkdir(parents=True, exist_ok=True)
@@ -2819,6 +3153,19 @@ def main():
     gui_host = str(first_job.get("csv_gui_host") or GUI_HOST)
     gui_port = int(first_job.get("csv_gui_port") or GUI_PORT)
     gui_exe_path = str(first_job.get("csv_gui_exe_path") or GUI_EXE_PATH)
+    local_gui_host_ip = _get_local_ipv4_for_gui()
+    gui_host = local_gui_host_ip
+    gui_port = 7481
+    changed_host_files = _override_all_config_gui_host(gui_host)
+    if changed_host_files:
+        print(f"[INFO] Updated GUI HOST in {len(changed_host_files)} config file(s).")
+        for changed in changed_host_files:
+            print(f"[INFO]   {changed.name}")
+    for job in jobs:
+        job["csv_gui_host"] = gui_host
+        job["csv_gui_port"] = gui_port
+    print(f"[INFO] GUI HostIP (local): {gui_host}")
+    print(f"[INFO] GUI Port: {gui_port}")
     written_results: List[Tuple[str, str]] = []
     if USE_GUI_CALIBRATION:
         GuiSocketClient = _load_gui_client_class()
@@ -2835,9 +3182,9 @@ def main():
     try:
         if AUTO_LAUNCH_GUI and gui_exe_path:
             exe_path = Path(gui_exe_path)
-            config_path = exe_path.parent / "Config" / "main.ini"
-            if not config_path.exists():
-                print(f"[WARN] GUI config not found: {config_path}")
+            config_path = _sync_gui_main_ini(exe_path, gui_host, gui_port)
+            if config_path is None:
+                print(f"[WARN] GUI config not found: {exe_path.parent / 'Config' / 'main.ini'}")
             original_cwd = os.getcwd()
             os.chdir(str(exe_path.parent))
             gui_proc = subprocess.Popen([str(exe_path)])
